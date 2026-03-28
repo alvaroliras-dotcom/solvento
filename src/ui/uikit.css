@@ -1,0 +1,88 @@
+/* SOLO COMPONENTES — NO GLOBAL */
+
+.card{
+  background: rgba(255,255,255,.06);
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 14px;
+  padding: 16px;
+  backdrop-filter: blur(6px);
+}
+
+.button{
+  background: rgba(255,255,255,.08);
+  border: 1px solid rgba(255,255,255,.18);
+  color: white;
+  padding: 6px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.button:hover{
+  background: rgba(255,255,255,.15);
+}
+
+.buttonPrimary{
+  background: #3b82f6;
+  border: none;
+}
+
+.buttonDanger{
+  background: #ef4444;
+  border: none;
+}
+
+.input{
+  background: rgba(255,255,255,.08);
+  border: 1px solid rgba(255,255,255,.18);
+  color: white;
+  padding: 6px 10px;
+  border-radius: 8px;
+}
+
+.badge{
+  background: rgba(255,255,255,.08);
+  padding: 4px 8px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.hr{
+  height: 1px;
+  background: rgba(255,255,255,.12);
+  margin: 14px 0;
+}
+
+.table{
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.table th{
+  text-align: left;
+  font-weight: 600;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(255,255,255,.12);
+}
+
+.table td{
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(255,255,255,.06);
+}
+
+.table .right{
+  text-align: right;
+}
+
+.muted{
+  opacity: .7;
+}
+
+.kpiLabel{
+  font-size: 13px;
+  opacity: .7;
+}
+
+.kpiValue{
+  font-size: 20px;
+  font-weight: 700;
+}

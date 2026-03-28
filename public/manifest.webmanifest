@@ -1,0 +1,17 @@
+{
+  "name": "Cerbero",
+  "short_name": "Cerbero",
+  "description": "Aplicación de control horario Cerbero",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#3CB7B7",
+  "icons": [
+    {
+      "src": "/cerbero-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

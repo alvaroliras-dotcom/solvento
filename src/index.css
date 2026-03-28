@@ -1,0 +1,70 @@
+/* === BASE CSS (estable, sin UI kit) === */
+
+:root{
+  --bg: #ffffff;
+  --text: #111111;
+  --muted: #666666;
+  --border: #d9d9d9;
+  --card: #ffffff;
+  --card2: #f8f8f8;
+  --primary: #4bada9;
+  --danger: #ef4444;
+  --radius: 14px;
+  --font: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+
+  /* Branding (Solvento) */
+  --brand: #4bada9;
+}
+
+*{ box-sizing: border-box; }
+
+html, body, #root{ height: 100%; }
+
+body{
+  margin: 0;
+  font-family: var(--font);
+  background: #ffffff;
+  color: var(--text);
+}
+
+/* Root ocupa toda la pantalla */
+#root{
+  width: 100%;
+  min-height: 100vh;
+}
+
+/* Mata cualquier fondo colado por wrappers */
+#root, main{
+  background: transparent !important;
+  min-height: 100vh;
+}
+
+a{ color: inherit; }
+
+/* contenedor base usado por páginas */
+.container{
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+/* =========================
+   LOGIN FULLSCREEN
+   ========================= */
+
+.loginPage{
+  min-height: 100vh;
+  width: 100%;
+  background: linear-gradient(180deg, #4bada9 0%, #dff3f2 58%, #ffffff 100%);
+}
+
+/* =========================
+   FONDO GENERAL PARA LA APP
+   (Admin / Worker), NO para login
+   ========================= */
+
+.appShell{
+  min-height: 100vh;
+  width: 100%;
+  background: linear-gradient(180deg, #F5F5F5 0%, #dff3f2 100%);
+}
