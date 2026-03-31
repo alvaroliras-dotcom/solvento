@@ -8,7 +8,7 @@ import { adminTheme } from "../ui/adminTheme";
 // PARTE 1/6 — TIPOS Y HELPERS
 // ======================================================
 
-type IncidentSourceType = "manual" | "automatic";
+type IncidentSourceType = "manual" | "automatic" | "time_request";
 
 type Incident = {
   adjustment_id: string;
@@ -41,6 +41,15 @@ type ResolutionStatsRow = {
   workflow_status: string | null;
   approved_at: string | null;
   flags: Record<string, any> | null;
+};
+
+type TimeRequestRow = {
+  id: string;
+  time_entry_id: string | null;
+  requested_by: string;
+  requested_at: string;
+  reason: string;
+  status: string;
 };
 
 function formatDateTime(value: string) {
@@ -94,6 +103,22 @@ function formatReason(value: unknown) {
       return "Salida fuera del centro de trabajo";
     case "check_in_outside_workplace":
       return "Entrada fuera del centro de trabajo";
+    case "missing_checkin_incident":
+      return "Falta fichaje de entrada";
+    case "late_checkin_incident":
+      return "Entrada tardía";
+    case "missing_lunch_checkout_incident":
+      return "Falta salida a comer";
+    case "late_lunch_checkout_incident":
+      return "Salida a comer tardía";
+    case "missing_afternoon_checkin_incident":
+      return "Falta vuelta de comer";
+    case "late_afternoon_checkin_incident":
+      return "Vuelta de comer tardía";
+    case "missing_final_checkout_incident":
+      return "Falta fichaje de salida final";
+    case "late_final_checkout_incident":
+      return "Salida final tardía";
     default:
       return value;
   }
@@ -103,8 +128,14 @@ function isAutomaticIncident(incident: Incident | null) {
   return incident?.source_type === "automatic";
 }
 
+function isTimeRequestIncident(incident: Incident | null) {
+  return incident?.source_type === "time_request";
+}
+
 function getIncidentTypeLabel(sourceType: IncidentSourceType) {
-  return sourceType === "automatic" ? "Automática" : "Manual";
+  if (sourceType === "automatic") return "Automática";
+  if (sourceType === "time_request") return "Por tramos";
+  return "Manual";
 }
 
 function getTodayRangeIso() {
@@ -166,7 +197,7 @@ export function AdminIncidentsPage() {
     return userId;
   }
 
-  // ======================================================
+   // ======================================================
   // PARTE 3/6 — CARGA Y ACCIONES
   // ======================================================
 
@@ -187,6 +218,12 @@ export function AdminIncidentsPage() {
       return;
     }
 
+    const { data: requestRows } = await supabase
+      .from("time_entry_requests")
+      .select("status,resolved_at")
+      .eq("company_id", membership.company_id)
+      .in("status", ["validated", "rejected"]);
+
     let validated = 0;
     let rejected = 0;
 
@@ -204,6 +241,15 @@ export function AdminIncidentsPage() {
 
       if (row.workflow_status === "adjusted") validated += 1;
       if (row.workflow_status === "rejected") rejected += 1;
+    }
+
+    for (const row of (requestRows ?? []) as Array<{ status: string; resolved_at: string | null }>) {
+      if (!isIsoWithinRange(row.resolved_at, fromIso, toIsoExclusive)) {
+        continue;
+      }
+
+      if (row.status === "validated") validated += 1;
+      if (row.status === "rejected") rejected += 1;
     }
 
     setValidatedToday(validated);
@@ -231,7 +277,7 @@ export function AdminIncidentsPage() {
       .eq("company_id", membership.company_id)
       .eq("workflow_status", "pending");
 
-    const auto: Incident[] =
+    const automatic: Incident[] =
       (autoRows ?? []).map((e: any) => ({
         adjustment_id: `auto-${e.id}`,
         time_entry_id: e.id,
@@ -245,7 +291,62 @@ export function AdminIncidentsPage() {
         source_type: "automatic",
       })) ?? [];
 
-    setIncidents([...manual, ...auto]);
+    const { data: requestRows } = await supabase
+      .from("time_entry_requests")
+      .select("id,time_entry_id,requested_by,requested_at,reason,status")
+      .eq("company_id", membership.company_id)
+      .eq("status", "pending")
+      .returns<TimeRequestRow[]>();
+
+    const requestTimeEntryIds = Array.from(
+      new Set(
+        (requestRows ?? [])
+          .map((row) => row.time_entry_id)
+          .filter((value): value is string => !!value)
+      )
+    );
+
+    const entriesById: Record<string, { check_in_at: string | null; check_out_at: string | null }> = {};
+
+    if (requestTimeEntryIds.length > 0) {
+      const { data: linkedEntries } = await supabase
+        .from("time_entries")
+        .select("id,check_in_at,check_out_at")
+        .in("id", requestTimeEntryIds);
+
+      for (const entry of linkedEntries ?? []) {
+        entriesById[entry.id] = {
+          check_in_at: entry.check_in_at,
+          check_out_at: entry.check_out_at,
+        };
+      }
+    }
+
+    const timeRequests: Incident[] =
+      (requestRows ?? []).map((row) => {
+        const linkedEntry = row.time_entry_id ? entriesById[row.time_entry_id] : null;
+
+        const baseDateIso = row.requested_at;
+        const fallbackDateTimeLocal = new Date(baseDateIso).toISOString().slice(0, 16);
+
+        return {
+          adjustment_id: row.id,
+          time_entry_id: row.time_entry_id ?? "",
+          user_id: row.requested_by,
+          check_in_at: linkedEntry?.check_in_at ?? fallbackDateTimeLocal,
+          proposed_check_out:
+            linkedEntry?.check_out_at ?? linkedEntry?.check_in_at ?? fallbackDateTimeLocal,
+          reason: row.reason,
+          created_at: row.requested_at,
+          source_type: "time_request",
+        };
+      }) ?? [];
+
+    const combined = [...manual, ...automatic, ...timeRequests].sort(
+      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    );
+
+    setIncidents(combined);
 
     const { data: profilesData } = await supabase.rpc("admin_company_profiles", {
       p_company_id: membership.company_id,
@@ -273,6 +374,25 @@ export function AdminIncidentsPage() {
     }
 
     setResolving(true);
+
+    if (isTimeRequestIncident(selectedIncident)) {
+      const { error } = await supabase.rpc("resolve_time_entry_request", {
+        p_request_id: selectedIncident.adjustment_id,
+        p_decision: decision,
+        p_resolution_reason: reason,
+      });
+
+      setResolving(false);
+
+      if (error) {
+        alert(error.message);
+        return;
+      }
+
+      closeIncidentModal();
+      await loadIncidents();
+      return;
+    }
 
     if (isAutomaticIncident(selectedIncident)) {
       const previousCheckOutAt =
@@ -377,6 +497,12 @@ export function AdminIncidentsPage() {
     setFinalCheckIn(item.check_in_at?.slice(0, 16) || "");
     setFinalCheckOut(item.proposed_check_out?.slice(0, 16) || "");
 
+    if (!item.time_entry_id) {
+      setSelectedEntryGeo(null);
+      setLoadingEntryGeo(false);
+      return;
+    }
+
     const { data, error } = await supabase
       .from("time_entries")
       .select(
@@ -430,7 +556,7 @@ export function AdminIncidentsPage() {
 
   const flags = selectedEntryGeo?.flags ?? null;
 
-  // ======================================================
+   // ======================================================
   // PARTE 5/6 — UI PRINCIPAL DE LA PÁGINA
   // ======================================================
 
@@ -974,7 +1100,11 @@ export function AdminIncidentsPage() {
                   <td>{formatReason(item.reason)}</td>
                   <td className="adminIncRight">
                     <button className="adminIncBtn primary" onClick={() => openIncidentModal(item)}>
-                      {item.source_type === "automatic" ? "Revisar" : "Resolver"}
+                      {item.source_type === "automatic"
+                        ? "Revisar"
+                        : item.source_type === "time_request"
+                        ? "Resolver"
+                        : "Resolver"}
                     </button>
                   </td>
                 </tr>
@@ -1000,7 +1130,6 @@ export function AdminIncidentsPage() {
         </div>
       </section>
 
-
       {selectedIncident && (
         <div
           className="adminIncModalOverlay"
@@ -1013,12 +1142,16 @@ export function AdminIncidentsPage() {
             <div className="adminIncModalHeader">
               <div>
                 <h3 className="adminIncModalTitle">
-                  {isAutomaticIncident(selectedIncident)
+                  {isTimeRequestIncident(selectedIncident)
+                    ? "Resolución de incidencia por tramos"
+                    : isAutomaticIncident(selectedIncident)
                     ? "Revisión de incidencia automática"
                     : "Resolución de incidencia manual"}
                 </h3>
                 <div className="adminIncModalSub">
-                  {isAutomaticIncident(selectedIncident)
+                  {isTimeRequestIncident(selectedIncident)
+                    ? "Incidencia creada automáticamente por faltar o llegar tarde en un tramo del día"
+                    : isAutomaticIncident(selectedIncident)
                     ? "Inspección completa del fichaje, sus flags y la geolocalización detectada"
                     : "Revisión completa de la solicitud manual y su geolocalización"}
                 </div>
@@ -1068,35 +1201,37 @@ export function AdminIncidentsPage() {
                   </div>
                 </div>
 
-                <div className="adminIncPanel">
-                  <h4 className="adminIncPanelTitle">Corrección del tramo</h4>
+                {!isTimeRequestIncident(selectedIncident) && (
+                  <div className="adminIncPanel">
+                    <h4 className="adminIncPanelTitle">Corrección del tramo</h4>
 
-                  <div className="adminIncEditGrid">
-                    <div>
-                      <div className="adminIncInfoLabel" style={{ marginBottom: 6 }}>
-                        Hora entrada corregida
+                    <div className="adminIncEditGrid">
+                      <div>
+                        <div className="adminIncInfoLabel" style={{ marginBottom: 6 }}>
+                          Hora entrada corregida
+                        </div>
+                        <input
+                          className="adminIncModalInput"
+                          type="datetime-local"
+                          value={finalCheckIn}
+                          onChange={(e) => setFinalCheckIn(e.target.value)}
+                        />
                       </div>
-                      <input
-                        className="adminIncModalInput"
-                        type="datetime-local"
-                        value={finalCheckIn}
-                        onChange={(e) => setFinalCheckIn(e.target.value)}
-                      />
-                    </div>
 
-                    <div>
-                      <div className="adminIncInfoLabel" style={{ marginBottom: 6 }}>
-                        Hora salida corregida
+                      <div>
+                        <div className="adminIncInfoLabel" style={{ marginBottom: 6 }}>
+                          Hora salida corregida
+                        </div>
+                        <input
+                          className="adminIncModalInput"
+                          type="datetime-local"
+                          value={finalCheckOut}
+                          onChange={(e) => setFinalCheckOut(e.target.value)}
+                        />
                       </div>
-                      <input
-                        className="adminIncModalInput"
-                        type="datetime-local"
-                        value={finalCheckOut}
-                        onChange={(e) => setFinalCheckOut(e.target.value)}
-                      />
                     </div>
                   </div>
-                </div>
+                )}
               </aside>
 
               <main className="adminIncCenterCol">
@@ -1117,11 +1252,21 @@ export function AdminIncidentsPage() {
                 <div className="adminIncPanel" style={{ minHeight: 0 }}>
                   <h4 className="adminIncPanelTitle">Geolocalización</h4>
 
+                  {isTimeRequestIncident(selectedIncident) && !selectedIncident.time_entry_id && (
+                    <div className="adminIncActionText">
+                      Esta incidencia por tramos no tiene un fichaje enlazado todavía.
+                    </div>
+                  )}
+
                   {loadingEntryGeo && <div className="adminIncActionText">Cargando ubicación…</div>}
 
-                  {!loadingEntryGeo && !selectedEntryGeo && (
-                    <div className="adminIncActionText">No se ha podido cargar la ubicación.</div>
-                  )}
+                  {!loadingEntryGeo &&
+                    !selectedEntryGeo &&
+                    !(isTimeRequestIncident(selectedIncident) && !selectedIncident.time_entry_id) && (
+                      <div className="adminIncActionText">
+                        No se ha podido cargar la ubicación.
+                      </div>
+                    )}
 
                   {!loadingEntryGeo && selectedEntryGeo && (
                     <div className="adminIncGeoGrid">
@@ -1323,7 +1468,9 @@ export function AdminIncidentsPage() {
                   <h4 className="adminIncPanelTitle">Acciones rápidas</h4>
 
                   <div className="adminIncActionText">
-                    {isAutomaticIncident(selectedIncident)
+                    {isTimeRequestIncident(selectedIncident)
+                      ? "Revisa el motivo de la incidencia por tramos y decide si la validas o la rechazas."
+                      : isAutomaticIncident(selectedIncident)
                       ? "Revisa mapas, horas, flags y geolocalización antes de validar o rechazar la incidencia automática."
                       : "Revisa la propuesta del trabajador, la ubicación y la coherencia del fichaje antes de validar o rechazar."}
                   </div>
