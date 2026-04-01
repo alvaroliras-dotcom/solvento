@@ -52,6 +52,13 @@ type TimeRequestRow = {
   status: string;
 };
 
+type CalendarRow = {
+  morning_start: string | null;
+  lunch_start: string | null;
+  afternoon_start: string | null;
+  day_end: string | null;
+};
+
 function formatDateTime(value: string) {
   return new Date(value).toLocaleString();
 }
@@ -161,6 +168,71 @@ function isIsoWithinRange(
   return time >= new Date(fromIso).getTime() && time < new Date(toIsoExclusive).getTime();
 }
 
+function timeStringToMinutes(value: string) {
+  const [hh, mm] = value.slice(0, 5).split(":").map(Number);
+  return hh * 60 + mm;
+}
+
+function minutesToTimeString(totalMinutes: number) {
+  const hh = String(Math.floor(totalMinutes / 60)).padStart(2, "0");
+  const mm = String(totalMinutes % 60).padStart(2, "0");
+  return `${hh}:${mm}:00`;
+}
+
+function getMadridDateParts(value: string) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Madrid",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(value));
+
+  const map = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+
+  return {
+    year: map.year,
+    month: map.month,
+    day: map.day,
+  };
+}
+
+function buildMadridDeadlineIso(requestedAt: string, baseTime: string) {
+  const { year, month, day } = getMadridDateParts(requestedAt);
+  const deadlineMinutes = timeStringToMinutes(baseTime) + 45;
+  const deadlineTime = minutesToTimeString(deadlineMinutes);
+
+  return `${year}-${month}-${day}T${deadlineTime}+01:00`;
+}
+
+function getTimeRequestFallbackIso(reason: string, requestedAt: string, calendar: CalendarRow | null) {
+  if (!calendar) return requestedAt;
+
+  switch (reason) {
+    case "missing_checkin_incident":
+      return calendar.morning_start
+        ? buildMadridDeadlineIso(requestedAt, calendar.morning_start)
+        : requestedAt;
+
+    case "missing_lunch_checkout_incident":
+      return calendar.lunch_start
+        ? buildMadridDeadlineIso(requestedAt, calendar.lunch_start)
+        : requestedAt;
+
+    case "missing_afternoon_checkin_incident":
+      return calendar.afternoon_start
+        ? buildMadridDeadlineIso(requestedAt, calendar.afternoon_start)
+        : requestedAt;
+
+    case "missing_final_checkout_incident":
+      return calendar.day_end
+        ? buildMadridDeadlineIso(requestedAt, calendar.day_end)
+        : requestedAt;
+
+    default:
+      return requestedAt;
+  }
+}
+
 // ======================================================
 // PARTE 2/6 — COMPONENTE Y ESTADO
 // ======================================================
@@ -186,6 +258,8 @@ export function AdminIncidentsPage() {
 
   const [validatedToday, setValidatedToday] = useState(0);
   const [rejectedToday, setRejectedToday] = useState(0);
+
+  const [calendarConfig, setCalendarConfig] = useState<CalendarRow | null>(null);
 
   function getWorkerLabel(userId: string) {
     const profile = profilesById[userId];
@@ -261,6 +335,14 @@ export function AdminIncidentsPage() {
 
     setLoading(true);
 
+    const { data: calendarData } = await supabase
+      .from("company_work_calendar")
+      .select("morning_start,lunch_start,afternoon_start,day_end")
+      .eq("company_id", membership.company_id)
+      .maybeSingle<CalendarRow>();
+
+    setCalendarConfig(calendarData ?? null);
+
     const { data: manualData } = await supabase.rpc("admin_pending_adjustments", {
       p_company_id: membership.company_id,
     });
@@ -325,17 +407,19 @@ export function AdminIncidentsPage() {
     const timeRequests: Incident[] =
       (requestRows ?? []).map((row) => {
         const linkedEntry = row.time_entry_id ? entriesById[row.time_entry_id] : null;
-
-        const baseDateIso = row.requested_at;
-        const fallbackDateTimeLocal = new Date(baseDateIso).toISOString().slice(0, 16);
+        const fallbackDateTime = getTimeRequestFallbackIso(
+          row.reason,
+          row.requested_at,
+          calendarData ?? null
+        );
 
         return {
           adjustment_id: row.id,
           time_entry_id: row.time_entry_id ?? "",
           user_id: row.requested_by,
-          check_in_at: linkedEntry?.check_in_at ?? fallbackDateTimeLocal,
+          check_in_at: linkedEntry?.check_in_at ?? fallbackDateTime,
           proposed_check_out:
-            linkedEntry?.check_out_at ?? linkedEntry?.check_in_at ?? fallbackDateTimeLocal,
+            linkedEntry?.check_out_at ?? linkedEntry?.check_in_at ?? fallbackDateTime,
           reason: row.reason,
           created_at: row.requested_at,
           source_type: "time_request",
