@@ -199,9 +199,11 @@ function getMadridDateParts(value: string) {
 function buildMadridDeadlineIso(requestedAt: string, baseTime: string) {
   const { year, month, day } = getMadridDateParts(requestedAt);
   const deadlineMinutes = timeStringToMinutes(baseTime) + 45;
-  const deadlineTime = minutesToTimeString(deadlineMinutes);
 
-  return `${year}-${month}-${day}T${deadlineTime}+01:00`;
+  const hh = String(Math.floor(deadlineMinutes / 60)).padStart(2, "0");
+  const mm = String(deadlineMinutes % 60).padStart(2, "0");
+
+  return `${year}-${month}-${day}T${hh}:${mm}:00`;
 }
 
 function getTimeRequestFallbackIso(reason: string, requestedAt: string, calendar: CalendarRow | null) {
