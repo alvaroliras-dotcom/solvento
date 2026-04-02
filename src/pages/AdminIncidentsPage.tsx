@@ -256,8 +256,9 @@ export function AdminIncidentsPage() {
 
   const [resolving, setResolving] = useState(false);
 
-  const [validatedToday, setValidatedToday] = useState(0);
-  const [rejectedToday, setRejectedToday] = useState(0);
+const [validatedToday, setValidatedToday] = useState(0);
+const [rejectedToday, setRejectedToday] = useState(0);
+const [calendarConfig, setCalendarConfig] = useState<CalendarRow | null>(null);
 
   function getWorkerLabel(userId: string) {
     const profile = profilesById[userId];
