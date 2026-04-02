@@ -173,12 +173,6 @@ function timeStringToMinutes(value: string) {
   return hh * 60 + mm;
 }
 
-function minutesToTimeString(totalMinutes: number) {
-  const hh = String(Math.floor(totalMinutes / 60)).padStart(2, "0");
-  const mm = String(totalMinutes % 60).padStart(2, "0");
-  return `${hh}:${mm}:00`;
-}
-
 function getMadridDateParts(value: string) {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Europe/Madrid",
@@ -206,7 +200,11 @@ function buildMadridDeadlineIso(requestedAt: string, baseTime: string) {
   return `${year}-${month}-${day}T${hh}:${mm}:00`;
 }
 
-function getTimeRequestFallbackIso(reason: string, requestedAt: string, calendar: CalendarRow | null) {
+function getTimeRequestFallbackIso(
+  reason: string,
+  requestedAt: string,
+  calendar: CalendarRow | null
+) {
   if (!calendar) return requestedAt;
 
   switch (reason) {
@@ -260,8 +258,6 @@ export function AdminIncidentsPage() {
 
   const [validatedToday, setValidatedToday] = useState(0);
   const [rejectedToday, setRejectedToday] = useState(0);
-
-  const [calendarConfig, setCalendarConfig] = useState<CalendarRow | null>(null);
 
   function getWorkerLabel(userId: string) {
     const profile = profilesById[userId];
