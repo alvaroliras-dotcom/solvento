@@ -258,7 +258,6 @@ export function AdminIncidentsPage() {
 
 const [validatedToday, setValidatedToday] = useState(0);
 const [rejectedToday, setRejectedToday] = useState(0);
-const [calendarConfig, setCalendarConfig] = useState<CalendarRow | null>(null);
 
   function getWorkerLabel(userId: string) {
     const profile = profilesById[userId];
@@ -339,8 +338,6 @@ const [calendarConfig, setCalendarConfig] = useState<CalendarRow | null>(null);
       .select("morning_start,lunch_start,afternoon_start,day_end")
       .eq("company_id", membership.company_id)
       .maybeSingle<CalendarRow>();
-
-    setCalendarConfig(calendarData ?? null);
 
     const { data: manualData } = await supabase.rpc("admin_pending_adjustments", {
       p_company_id: membership.company_id,
