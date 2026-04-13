@@ -13,22 +13,24 @@ firebase.initializeApp({
 const messaging = firebase.messaging();
 
 messaging.onBackgroundMessage((payload) => {
+  if (payload?.notification) {
+    return;
+  }
+
   const notificationTitle =
-    payload?.notification?.title ||
-    payload?.data?.title ||
-    "Cerbero";
+    payload?.data?.title || "Cerbero";
 
   const notificationOptions = {
-    body:
-      payload?.notification?.body ||
-      payload?.data?.body ||
-      "Tienes una notificación pendiente.",
-    icon: "/pwa-192x192.png",
-    badge: "/pwa-192x192.png",
-    data: {
-      url: payload?.data?.url || "/worker",
-    },
-  };
+  body:
+    payload?.data?.body || "Tienes una notificación pendiente.",
+  icon: "/pwa-192x192.png",
+  badge: "/pwa-192x192.png",
+  requireInteraction: true,
+  silent: false,
+  data: {
+    url: payload?.data?.url || "/worker",
+  },
+};
 
   self.registration.showNotification(notificationTitle, notificationOptions);
 });
