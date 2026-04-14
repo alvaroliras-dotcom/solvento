@@ -472,10 +472,20 @@ export function WorkerPage() {
   // ======================================================
 
   useEffect(() => {
-    supabase.auth.getUser().then(({ data }) => {
-      setUserId(data.user?.id ?? null);
-    });
-  }, []);
+  supabase.auth.getUser().then(({ data }) => {
+    setUserId(data.user?.id ?? null);
+  });
+
+  navigator.geolocation.getCurrentPosition(
+    () => {},
+    () => {},
+    {
+      enableHighAccuracy: true,
+      timeout: 5000,
+      maximumAge: 0,
+    }
+  );
+}, []);
 
   useEffect(() => {
     if (!activeCompany || !userId) return;
