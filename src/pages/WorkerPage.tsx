@@ -333,7 +333,7 @@ export function WorkerPage() {
   const hasAdjustableContext = !!openEntry || todayEntries.length > 0;
 
   const isMainBlocked = false;
-  const isAdjustBlocked = !hasAdjustableContext || isPending;
+  const isAdjustBlocked = false;
 
   const topMessage = useMemo(() => {
     if (!membership) {
