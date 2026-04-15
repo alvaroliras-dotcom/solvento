@@ -326,13 +326,10 @@ export function WorkerPage() {
     return null;
   }, [openEntry, lastTodayEntry]);
 
-  const isPending = adjustmentTarget?.workflow_status === "pending";
-  const requiresNewProposal =
+    const requiresNewProposal =
     adjustmentTarget?.workflow_status === "requires_new_proposal";
 
-  const hasAdjustableContext = !!openEntry || todayEntries.length > 0;
-
-  const isMainBlocked = false;
+   const isMainBlocked = false;
   const isAdjustBlocked = false;
 
   const topMessage = useMemo(() => {
