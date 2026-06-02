@@ -1,15 +1,32 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { supabase } from "../lib/supabaseClient";
 import { useNavigate } from "react-router-dom";
 import { adminTheme } from "../ui/adminTheme";
+
+// Clave con la que se guarda el correo recordado en este dispositivo.
+const REMEMBER_KEY = "cerbero_saved_email";
 
 export function LoginPage() {
   const navigate = useNavigate();
 
   const [email, setEmail] = useState("");
   const [pin, setPin] = useState("");
+  const [remember, setRemember] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  const pinRef = useRef<HTMLInputElement>(null);
+
+  // Al cargar la pantalla, recuperamos el usuario guardado en este dispositivo (si lo hay).
+  useEffect(() => {
+    const saved = localStorage.getItem(REMEMBER_KEY);
+    if (saved) {
+      setEmail(saved);
+      setRemember(true);
+      // Si ya tenemos el correo, llevamos el foco directo al PIN.
+      setTimeout(() => pinRef.current?.focus(), 100);
+    }
+  }, []);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -39,6 +56,14 @@ export function LoginPage() {
       setLoading(false);
       setError("Correo o PIN incorrectos.");
       return;
+    }
+
+    // Guardamos (o borramos) el usuario recordado en este dispositivo.
+    // OJO: solo se guarda el CORREO, nunca el PIN.
+    if (remember) {
+      localStorage.setItem(REMEMBER_KEY, cleanEmail);
+    } else {
+      localStorage.removeItem(REMEMBER_KEY);
     }
 
     const { data: memberships, error: membershipsError } = await supabase.rpc("my_memberships");
@@ -135,6 +160,7 @@ export function LoginPage() {
           />
 
           <input
+            ref={pinRef}
             type="password"
             inputMode="numeric"
             autoComplete="current-password"
@@ -154,6 +180,27 @@ export function LoginPage() {
               boxSizing: "border-box",
             }}
           />
+
+          <label
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              fontSize: 13,
+              color: adminTheme.colors.textSoft,
+              fontWeight: 600,
+              cursor: "pointer",
+              userSelect: "none",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={remember}
+              onChange={(e) => setRemember(e.target.checked)}
+              style={{ width: 18, height: 18, cursor: "pointer" }}
+            />
+            Recordar mi usuario en este dispositivo
+          </label>
 
           <button
             disabled={loading}
