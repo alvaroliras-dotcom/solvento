@@ -63,6 +63,53 @@ function formatDateTime(value: string) {
   return new Date(value).toLocaleString();
 }
 
+// ======================================================
+// CONVERSIÓN DE HORAS PARA LOS CAMPOS DE CORRECCIÓN
+// ======================================================
+// Los campos <input type="datetime-local"> trabajan SIEMPRE en
+// hora local del navegador. La base de datos guarda en UTC.
+//
+// Antes se cortaba el texto de la fecha en crudo (.slice(0, 16)),
+// lo que metía la hora UTC en un campo que se lee como local: el
+// administrador veía dos horas menos de la real en verano, y si
+// validaba sin tocar el campo, el fichaje se guardaba desplazado.
+//
+// Estas dos funciones hacen la conversión en los dos sentidos.
+
+function toDateTimeLocalValue(value: string | null | undefined) {
+  if (!value) return "";
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+
+  const pad = (n: number) => String(n).padStart(2, "0");
+
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}`
+  );
+}
+
+function fromDateTimeLocalValue(value: string) {
+  if (!value) return null;
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+
+  return date.toISOString();
+}
+
+function sameInstant(a: string | null | undefined, b: string | null | undefined) {
+  if (!a || !b) return a === b;
+
+  const da = new Date(a).getTime();
+  const db = new Date(b).getTime();
+
+  if (Number.isNaN(da) || Number.isNaN(db)) return false;
+
+  return da === db;
+}
+
 function buildGoogleMapsEmbedUrl(lat: number, lng: number) {
   return `https://maps.google.com/maps?q=${lat},${lng}&z=16&output=embed`;
 }
@@ -495,12 +542,15 @@ const [rejectedToday, setRejectedToday] = useState(0);
       };
 
       if (decision === "validated") {
-        if (finalCheckIn) {
-          updatePayload.check_in_at = new Date(finalCheckIn).toISOString();
+        const nextCheckIn = fromDateTimeLocalValue(finalCheckIn);
+        const nextCheckOut = fromDateTimeLocalValue(finalCheckOut);
+
+        if (nextCheckIn) {
+          updatePayload.check_in_at = nextCheckIn;
         }
 
-        if (finalCheckOut) {
-          updatePayload.check_out_at = new Date(finalCheckOut).toISOString();
+        if (nextCheckOut) {
+          updatePayload.check_out_at = nextCheckOut;
         }
       }
 
@@ -530,12 +580,10 @@ const [rejectedToday, setRejectedToday] = useState(0);
           workflow_status: "pending",
         },
         new_values: {
-          check_in_at: finalCheckIn
-            ? new Date(finalCheckIn).toISOString()
-            : selectedIncident.check_in_at,
-          check_out_at: finalCheckOut
-            ? new Date(finalCheckOut).toISOString()
-            : previousCheckOutAt,
+          check_in_at:
+            fromDateTimeLocalValue(finalCheckIn) ?? selectedIncident.check_in_at,
+          check_out_at:
+            fromDateTimeLocalValue(finalCheckOut) ?? previousCheckOutAt,
           workflow_status: decision === "validated" ? "adjusted" : "rejected",
           resolution_reason: reason,
         },
@@ -547,22 +595,73 @@ const [rejectedToday, setRejectedToday] = useState(0);
       return;
     }
 
+    // ----------------------------------------------------
+    // INCIDENCIA MANUAL (pedida por el trabajador)
+    // ----------------------------------------------------
+    // La función de base de datos solo sabe corregir la SALIDA.
+    // Antes, la hora de entrada que escribía el administrador se
+    // descartaba en silencio: pulsaba validar, parecía que había
+    // funcionado, y la entrada seguía igual.
+    // Ahora la salida la sigue corrigiendo la función, y la
+    // entrada se aplica aquí y se deja registrada.
+
+    const nextCheckOut =
+      decision === "validated" ? fromDateTimeLocalValue(finalCheckOut) : null;
+
+    const nextCheckIn =
+      decision === "validated" ? fromDateTimeLocalValue(finalCheckIn) : null;
+
+    const { data: authData } = await supabase.auth.getUser();
+    const adminUserId = authData.user?.id ?? null;
+
     const { error } = await supabase.rpc("resolve_time_entry_adjustment", {
       p_adjustment_id: selectedIncident.adjustment_id,
       p_decision: decision,
       p_resolution_reason: reason,
-      p_final_check_out:
-        decision === "validated" && finalCheckOut
-          ? new Date(finalCheckOut).toISOString()
-          : null,
+      p_final_check_out: nextCheckOut,
     });
 
-    setResolving(false);
-
     if (error) {
+      setResolving(false);
       alert(error.message);
       return;
     }
+
+    const checkInChanged =
+      !!nextCheckIn && !sameInstant(nextCheckIn, selectedIncident.check_in_at);
+
+    if (checkInChanged && selectedIncident.time_entry_id) {
+      const { error: checkInError } = await supabase
+        .from("time_entries")
+        .update({ check_in_at: nextCheckIn })
+        .eq("id", selectedIncident.time_entry_id);
+
+      if (checkInError) {
+        setResolving(false);
+        alert(
+          "La salida se ha corregido, pero la entrada no: " +
+            checkInError.message,
+        );
+        return;
+      }
+
+      await supabase.from("time_entry_logs").insert({
+        company_id: membership?.company_id,
+        time_entry_id: selectedIncident.time_entry_id,
+        action: "check_in_corrected",
+        performed_by: adminUserId,
+        performed_role: "admin",
+        old_values: {
+          check_in_at: selectedIncident.check_in_at,
+        },
+        new_values: {
+          check_in_at: nextCheckIn,
+          resolution_reason: reason,
+        },
+      });
+    }
+
+    setResolving(false);
 
     closeIncidentModal();
     await loadIncidents();
@@ -574,8 +673,10 @@ const [rejectedToday, setRejectedToday] = useState(0);
     setLoadingEntryGeo(true);
     setResolutionReason("");
 
-    setFinalCheckIn(item.check_in_at?.slice(0, 16) || "");
-    setFinalCheckOut(item.proposed_check_out?.slice(0, 16) || "");
+    // Convertidas a hora local. Antes se cortaba el texto en crudo
+    // y se colaba la hora UTC en un campo que se lee como local.
+    setFinalCheckIn(toDateTimeLocalValue(item.check_in_at));
+    setFinalCheckOut(toDateTimeLocalValue(item.proposed_check_out));
 
     if (!item.time_entry_id) {
       setSelectedEntryGeo(null);
