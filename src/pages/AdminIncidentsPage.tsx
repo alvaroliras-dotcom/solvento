@@ -157,6 +157,8 @@ function formatReason(value: unknown) {
       return "Salida fuera del centro de trabajo";
     case "check_in_outside_workplace":
       return "Entrada fuera del centro de trabajo";
+    case "extra_daily_entry":
+      return "Tercer tramo del día (revisar)";
     case "missing_checkin_incident":
       return "Falta fichaje de entrada";
     case "late_checkin_incident":
