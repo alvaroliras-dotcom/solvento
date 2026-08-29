@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
 import {
   useOpenEntry,
@@ -264,6 +264,17 @@ export function WorkerPage() {
   const [adjustReason, setAdjustReason] = useState("");
   const [tick, setTick] = useState(0);
 
+  // Error del último intento de fichar. Antes no existía: si el fichaje
+  // fallaba, el error se perdía por el camino y el trabajador se iba
+  // convencido de haber fichado.
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  // Bloqueo inmediato del botón. El estado "cargando" de la mutación
+  // tarda en activarse porque antes hay que esperar al GPS, y en esos
+  // segundos se podía pulsar dos veces y crear dos jornadas.
+  const pressingRef = useRef(false);
+  const [pressing, setPressing] = useState(false);
+
   const goalHours = 8;
   const goalMinutes = goalHours * 60;
 
@@ -381,7 +392,7 @@ export function WorkerPage() {
   }, [totalTodayMinutes, goalMinutes]);
 
   const isBusy =
-    (isOpen && checkOut.isPending) || (!isOpen && checkIn.isPending);
+    pressing || (isOpen && checkOut.isPending) || (!isOpen && checkIn.isPending);
 
   const mainLabel = isOpen ? "SALIR" : "ENTRAR";
   const todayShown = todayEntries.slice(0, 2);
@@ -415,34 +426,62 @@ export function WorkerPage() {
     setHistoryLoading(false);
   }
 
-	async function onMainPress() {
-	  if (isMainBlocked || !activeCompany || !userId) return;
+  function describeError(err: unknown) {
+    const raw =
+      err instanceof Error ? err.message : typeof err === "string" ? err : "";
 
-	  const geo = await getCurrentPosition();
+    if (raw.includes("Ya tienes una jornada abierta")) {
+      return "Ya tienes una jornada abierta sin cerrar. Ficha la salida antes de volver a entrar.";
+    }
+    if (raw.includes("No estas dado de alta") || raw.includes("No estás dado de alta")) {
+      return "Tu cuenta no está dada de alta en la empresa. Avisa a administración.";
+    }
+    if (raw.includes("ya estaba cerrada")) {
+      return "Esa jornada ya estaba cerrada. Recarga la aplicación para ver el estado real.";
+    }
+    if (raw.includes("dos tramos")) {
+      return "Ya has registrado los dos tramos de hoy. Avisa a administración para que lo corrija.";
+    }
+    if (raw.includes("Failed to fetch") || raw.includes("NetworkError")) {
+      return "No hay conexión. Tu fichaje NO se ha registrado. Inténtalo otra vez.";
+    }
 
-	  // Releer SIEMPRE el estado real justo antes de decidir
-	  const { data: freshOpenEntry } = await refetchOpenEntry();
+    return raw
+      ? `No se ha podido registrar el fichaje: ${raw}`
+      : "No se ha podido registrar el fichaje. Inténtalo otra vez.";
+  }
 
-	  if (!freshOpenEntry) {
-		checkIn.mutate(geo, {
-		  onSuccess: async () => {
-			await loadHistory();
-			await refetchOpenEntry();
-		  },
-		});
-		return;
-	  }
+  async function onMainPress() {
+    if (isMainBlocked || !activeCompany || !userId) return;
 
-	  checkOut.mutate(
-		{ entryId: freshOpenEntry.id, geo },
-		{
-		  onSuccess: async () => {
-			await loadHistory();
-			await refetchOpenEntry();
-		  },
-		}
-	  );
-	}
+    // Cortamos aquí el segundo toque, antes de esperar al GPS.
+    if (pressingRef.current) return;
+    pressingRef.current = true;
+    setPressing(true);
+    setActionError(null);
+
+    try {
+      const geo = await getCurrentPosition();
+
+      // Releer SIEMPRE el estado real justo antes de decidir
+      const { data: freshOpenEntry } = await refetchOpenEntry();
+
+      if (!freshOpenEntry) {
+        await checkIn.mutateAsync(geo);
+      } else {
+        await checkOut.mutateAsync({ entryId: freshOpenEntry.id, geo });
+      }
+
+      await loadHistory();
+      await refetchOpenEntry();
+    } catch (err) {
+      setActionError(describeError(err));
+      await refetchOpenEntry();
+    } finally {
+      pressingRef.current = false;
+      setPressing(false);
+    }
+  }
 
   async function onSubmitAdjustment() {
     if (!adjustmentTarget) return;
@@ -458,8 +497,12 @@ export function WorkerPage() {
       });
 
       setAdjustReason("");
+      setActionError(null);
       await loadHistory();
     } catch (err) {
+      setActionError(
+        "No se ha podido enviar la solicitud. Inténtalo otra vez o avisa a administración.",
+      );
       console.error(err);
     }
   }
@@ -961,7 +1004,30 @@ export function WorkerPage() {
             </button>
           </div>
 
-          {(topMessage || historyError) && (
+          {actionError && (
+            <div className="workerMessage error" role="alert">
+              {actionError}
+              <button
+                type="button"
+                onClick={() => setActionError(null)}
+                style={{
+                  display: "block",
+                  margin: "10px auto 0",
+                  border: "none",
+                  background: "transparent",
+                  color: "inherit",
+                  font: "inherit",
+                  fontWeight: 800,
+                  textDecoration: "underline",
+                  cursor: "pointer",
+                }}
+              >
+                Entendido
+              </button>
+            </div>
+          )}
+
+          {!actionError && (topMessage || historyError) && (
             <div className={`workerMessage ${historyError ? "error" : ""}`}>
               {historyError ? historyError : topMessage}
             </div>
