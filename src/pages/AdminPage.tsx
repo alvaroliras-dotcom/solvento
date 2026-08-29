@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { supabase } from "../lib/supabaseClient";
+import { fetchAllRows } from "../lib/fetchAllRows";
 import { useActiveMembership } from "../app/useActiveMembership";
 import { adminTheme } from "../ui/adminTheme";
 
@@ -589,13 +590,20 @@ export function AdminPage() {
 
     setClosesInRange(closesCount ?? 0);
 
-    const { data: metricRows, error: metricErr } = await supabase
-      .from("time_entries")
-      .select("user_id,check_in_at,check_out_at")
-      .eq("company_id", membership.company_id)
-      .gte("check_in_at", range.fromIso)
-      .lt("check_in_at", range.toIsoExclusive)
-      .not("check_out_at", "is", null);
+    // Por bloques: si se cortaba a 1.000 filas, el total de horas
+    // que se mostraba era menor que el real.
+    const { data: metricRows, error: metricErr } = await fetchAllRows<TimeEntryForMetrics>(
+      (desde, hasta) =>
+        supabase
+          .from("time_entries")
+          .select("user_id,check_in_at,check_out_at")
+          .eq("company_id", membership.company_id)
+          .gte("check_in_at", range.fromIso)
+          .lt("check_in_at", range.toIsoExclusive)
+          .not("check_out_at", "is", null)
+          .order("check_in_at", { ascending: true })
+          .range(desde, hasta),
+    );
 
     if (metricErr) {
       setError(metricErr.message);
@@ -610,13 +618,17 @@ export function AdminPage() {
     setMetricsByUser(arr);
     setTotalMinutesInRange(total);
 
-    const { data: inspRows, error: inspErr } = await supabase
-      .from("time_entries")
-      .select("id,user_id,check_in_at,check_out_at,status,workflow_status,flags")
-      .eq("company_id", membership.company_id)
-      .gte("check_in_at", range.fromIso)
-      .lt("check_in_at", range.toIsoExclusive)
-      .order("check_in_at", { ascending: true });
+    const { data: inspRows, error: inspErr } = await fetchAllRows<any>(
+      (desde, hasta) =>
+        supabase
+          .from("time_entries")
+          .select("id,user_id,check_in_at,check_out_at,status,workflow_status,flags")
+          .eq("company_id", membership.company_id)
+          .gte("check_in_at", range.fromIso)
+          .lt("check_in_at", range.toIsoExclusive)
+          .order("check_in_at", { ascending: true })
+          .range(desde, hasta),
+    );
 
     if (inspErr) {
       setError(inspErr.message);
@@ -679,13 +691,16 @@ export function AdminPage() {
     setExporting("detail");
     setError(null);
 
-    const { data, error } = await supabase
-      .from("time_entries")
-      .select("id,user_id,check_in_at,check_out_at,status,workflow_status,created_at,created_by,approved_at,approved_by,flags")
-      .eq("company_id", membership.company_id)
-      .gte("check_in_at", range.fromIso)
-      .lt("check_in_at", range.toIsoExclusive)
-      .order("check_in_at", { ascending: true });
+    const { data, error } = await fetchAllRows<TimeEntryForCsv>((desde, hasta) =>
+      supabase
+        .from("time_entries")
+        .select("id,user_id,check_in_at,check_out_at,status,workflow_status,created_at,created_by,approved_at,approved_by,flags")
+        .eq("company_id", membership.company_id)
+        .gte("check_in_at", range.fromIso)
+        .lt("check_in_at", range.toIsoExclusive)
+        .order("check_in_at", { ascending: true })
+        .range(desde, hasta),
+    );
 
     if (error) {
       setError(error.message);
