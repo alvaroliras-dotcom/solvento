@@ -1,1162 +1,1789 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { supabase } from "../lib/supabaseClient";
-import {
-  useOpenEntry,
-  useCheckIn,
-  useCheckOut,
-  useCreateAdjustment,
-} from "../domain/timeEntries/timeEntries.hooks";
-import { useActiveMembership } from "../app/useActiveMembership";
-import { useRegisterPushDevice } from "../app/useRegisterPushDevice";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { supabase } from "../lib/supabaseClient";
+import { useActiveMembership } from "../app/useActiveMembership";
 import { adminTheme } from "../ui/adminTheme";
 
 // ======================================================
 // PARTE 1/6 — TIPOS Y HELPERS
 // ======================================================
 
-type HistoryEntry = {
-  id: string;
+type IncidentSourceType = "manual" | "automatic" | "time_request";
+
+type Incident = {
+  adjustment_id: string;
+  time_entry_id: string;
+  user_id: string;
   check_in_at: string;
-  check_out_at: string | null;
-  workflow_status: "auto" | "pending" | "adjusted" | "requires_new_proposal";
+  proposed_check_out: string;
+  reason: string;
+  created_at: string;
+  source_type: IncidentSourceType;
 };
 
-type GeoPayload = {
-  lat: number;
-  lng: number;
-  accuracy: number | null;
-  capturedAt: string;
+type Profile = {
+  id: string;
+  email: string | null;
+  full_name: string | null;
 };
 
-function pad2(n: number) {
-  return String(n).padStart(2, "0");
+type EntryGeoDetail = {
+  check_in_geo_lat: number | null;
+  check_in_geo_lng: number | null;
+  check_in_geo_accuracy_m: number | null;
+  check_out_geo_lat: number | null;
+  check_out_geo_lng: number | null;
+  check_out_geo_accuracy_m: number | null;
+  flags: Record<string, any> | null;
+};
+
+type ResolutionStatsRow = {
+  workflow_status: string | null;
+  approved_at: string | null;
+  flags: Record<string, any> | null;
+};
+
+type TimeRequestRow = {
+  id: string;
+  time_entry_id: string | null;
+  requested_by: string;
+  requested_at: string;
+  reason: string;
+  status: string;
+};
+
+type CalendarRow = {
+  morning_start: string | null;
+  lunch_start: string | null;
+  afternoon_start: string | null;
+  day_end: string | null;
+};
+
+function formatDateTime(value: string) {
+  return new Date(value).toLocaleString();
 }
 
-function formatHHMM(iso: string) {
-  const d = new Date(iso);
-  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-}
+// ======================================================
+// CONVERSIÓN DE HORAS PARA LOS CAMPOS DE CORRECCIÓN
+// ======================================================
+// Los campos <input type="datetime-local"> trabajan SIEMPRE en
+// hora local del navegador. La base de datos guarda en UTC.
+//
+// Antes se cortaba el texto de la fecha en crudo (.slice(0, 16)),
+// lo que metía la hora UTC en un campo que se lee como local: el
+// administrador veía dos horas menos de la real en verano, y si
+// validaba sin tocar el campo, el fichaje se guardaba desplazado.
+//
+// Estas dos funciones hacen la conversión en los dos sentidos.
 
-function minutesBetween(startIso: string, endIso: string | null) {
-  const start = new Date(startIso).getTime();
-  const end = endIso ? new Date(endIso).getTime() : Date.now();
-  const diffMs = Math.max(0, end - start);
-  return Math.floor(diffMs / 60000);
-}
+function toDateTimeLocalValue(value: string | null | undefined) {
+  if (!value) return "";
 
-function hhmmFromMinutes(totalMinutes: number) {
-  const m = Math.max(0, Math.floor(totalMinutes));
-  const h = Math.floor(m / 60);
-  const mm = m % 60;
-  return `${pad2(h)}:${pad2(mm)}`;
-}
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
 
-function isSameLocalDay(iso: string, day: Date) {
-  const d = new Date(iso);
+  const pad = (n: number) => String(n).padStart(2, "0");
+
   return (
-    d.getFullYear() === day.getFullYear() &&
-    d.getMonth() === day.getMonth() &&
-    d.getDate() === day.getDate()
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}`
   );
 }
 
-function formatLongDateEs(d: Date) {
-  const weekday = d.toLocaleDateString("es-ES", { weekday: "long" });
-  const day = d.getDate();
-  const month = d.toLocaleDateString("es-ES", { month: "long" });
-  return `${weekday}, ${day} de ${month}`;
+function fromDateTimeLocalValue(value: string) {
+  if (!value) return null;
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+
+  return date.toISOString();
 }
 
-function getCurrentPosition(): Promise<GeoPayload | null> {
-  return new Promise((resolve) => {
-    if (!navigator.geolocation) {
-      resolve(null);
-      return;
-    }
+function sameInstant(a: string | null | undefined, b: string | null | undefined) {
+  if (!a || !b) return a === b;
 
-    navigator.geolocation.getCurrentPosition(
-      (position) => {
-        resolve({
-          lat: position.coords.latitude,
-          lng: position.coords.longitude,
-          accuracy: Number.isFinite(position.coords.accuracy)
-            ? position.coords.accuracy
-            : null,
-          capturedAt: new Date(position.timestamp).toISOString(),
-        });
-      },
-      () => resolve(null),
-      {
-        enableHighAccuracy: true,
-        timeout: 5000,
-        maximumAge: 0,
-      }
-    );
-  });
+  const da = new Date(a).getTime();
+  const db = new Date(b).getTime();
+
+  if (Number.isNaN(da) || Number.isNaN(db)) return false;
+
+  return da === db;
 }
 
-function BracketArrowIcon({ direction }: { direction: "in" | "out" }) {
-  const flip = direction === "out";
-
-  return (
-    <svg width="74" height="74" viewBox="0 0 48 48" fill="none" aria-hidden="true">
-      <g transform={flip ? "translate(48,0) scale(-1,1)" : undefined}>
-        <path
-          d="M28 10H34V38H28"
-          stroke="currentColor"
-          strokeWidth="3.6"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
-        <path d="M12 24H27" stroke="currentColor" strokeWidth="3.6" strokeLinecap="round" />
-        <path
-          d="M22 18.5L27.5 24L22 29.5"
-          stroke="currentColor"
-          strokeWidth="3.6"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
-      </g>
-    </svg>
-  );
+function buildGoogleMapsEmbedUrl(lat: number, lng: number) {
+  return `https://maps.google.com/maps?q=${lat},${lng}&z=16&output=embed`;
 }
 
-function IconButton({
-  onClick,
-  disabled,
-  title,
-  children,
-}: {
-  onClick: () => void;
-  disabled?: boolean;
-  title: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={!!disabled}
-      title={title}
-      aria-label={title}
-      style={{
-        width: 64,
-        height: 64,
-        borderRadius: 18,
-        border: `1px solid ${adminTheme.colors.border}`,
-        background: adminTheme.colors.panelSoft,
-        color: adminTheme.colors.text,
-        display: "grid",
-        placeItems: "center",
-        cursor: disabled ? "not-allowed" : "pointer",
-        opacity: disabled ? 0.45 : 1,
-        boxShadow: adminTheme.shadow.sm,
-      }}
-    >
-      {children}
-    </button>
-  );
+function buildGoogleMapsExternalUrl(lat: number, lng: number) {
+  return `https://www.google.com/maps?q=${lat},${lng}`;
 }
 
-function SettingsIcon() {
-  return (
-    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path
-        d="M12 15.2a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4Z"
-        stroke="currentColor"
-        strokeWidth="2"
-      />
-      <path
-        d="M19.4 12a7.6 7.6 0 0 0-.1-1l2-1.5-2-3.4-2.4 1a7.8 7.8 0 0 0-1.7-1l-.4-2.6H9.2l-.4 2.6a7.8 7.8 0 0 0-1.7 1l-2.4-1-2 3.4 2 1.5a7.6 7.6 0 0 0 0 2l-2 1.5 2 3.4 2.4-1c.5.4 1.1.8 1.7 1l.4 2.6h5.6l.4-2.6c.6-.2 1.2-.6 1.7-1l2.4 1 2-3.4-2-1.5c.1-.3.1-.6.1-1Z"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
+function formatCoords(lat: number, lng: number) {
+  return `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
 }
 
-function HistoryIcon() {
-  return (
-    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path
-        d="M12 8v5l3 2"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-      <path
-        d="M3 12a9 9 0 1 0 3-6.7"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinecap="round"
-      />
-      <path
-        d="M3 5v4h4"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
+function formatDistance(value: unknown) {
+  if (typeof value !== "number" || Number.isNaN(value)) return "No disponible";
+  return `${Math.round(value)} m`;
 }
 
-function BriefcaseIcon() {
-  return (
-    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path
-        d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-      <path
-        d="M4 8h16v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8Z"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
+function formatBool(value: unknown) {
+  if (value === true) return "Sí";
+  if (value === false) return "No";
+  return "No evaluable";
 }
 
-function LogoutIcon() {
-  return (
-    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path
-        d="M10 7V6a2 2 0 0 1 2-2h7v16h-7a2 2 0 0 1-2-2v-1"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinejoin="round"
-      />
-      <path d="M4 12h10" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-      <path
-        d="M8 8l-4 4 4 4"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
+function formatReason(value: unknown) {
+  if (typeof value !== "string" || !value) return "No disponible";
+
+  switch (value) {
+    case "low_accuracy":
+      return "Precisión insuficiente";
+    case "inside_workplace_radius":
+      return "Dentro del radio permitido";
+    case "outside_workplace_radius":
+      return "Fuera del radio permitido";
+    case "no_geolocation":
+      return "Sin geolocalización";
+    case "open_entry_crossed_day":
+      return "Jornada abierta de un día anterior";
+    case "open_entry_exceeded_hours":
+      return "Jornada demasiado larga";
+    case "zero_length_shift":
+      return "Tramo de duración casi cero";
+    case "possible_missed_lunch_checkout":
+      return "Posible olvido de salida para la comida";
+    case "check_out_outside_workplace":
+      return "Salida fuera del centro de trabajo";
+    case "check_in_outside_workplace":
+      return "Entrada fuera del centro de trabajo";
+    case "missing_checkin_incident":
+      return "Falta fichaje de entrada";
+    case "late_checkin_incident":
+      return "Entrada tardía";
+    case "missing_lunch_checkout_incident":
+      return "Falta salida a comer";
+    case "late_lunch_checkout_incident":
+      return "Salida a comer tardía";
+    case "missing_afternoon_checkin_incident":
+      return "Falta vuelta de comer";
+    case "late_afternoon_checkin_incident":
+      return "Vuelta de comer tardía";
+    case "missing_final_checkout_incident":
+      return "Falta fichaje de salida final";
+    case "late_final_checkout_incident":
+      return "Salida final tardía";
+    default:
+      return value;
+  }
+}
+
+function isAutomaticIncident(incident: Incident | null) {
+  return incident?.source_type === "automatic";
+}
+
+function isTimeRequestIncident(incident: Incident | null) {
+  return incident?.source_type === "time_request";
+}
+
+function getIncidentTypeLabel(sourceType: IncidentSourceType) {
+  if (sourceType === "automatic") return "Automática";
+  if (sourceType === "time_request") return "Por tramos";
+  return "Manual";
+}
+
+function getTodayRangeIso() {
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+
+  const end = new Date(start);
+  end.setDate(end.getDate() + 1);
+
+  return {
+    fromIso: start.toISOString(),
+    toIsoExclusive: end.toISOString(),
+  };
+}
+
+function isIsoWithinRange(
+  value: string | null | undefined,
+  fromIso: string,
+  toIsoExclusive: string
+) {
+  if (!value) return false;
+  const time = new Date(value).getTime();
+  return time >= new Date(fromIso).getTime() && time < new Date(toIsoExclusive).getTime();
+}
+
+function timeStringToMinutes(value: string) {
+  const [hh, mm] = value.slice(0, 5).split(":").map(Number);
+  return hh * 60 + mm;
+}
+
+function getMadridDateParts(value: string) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Madrid",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(value));
+
+  const map = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+
+  return {
+    year: map.year,
+    month: map.month,
+    day: map.day,
+  };
+}
+
+function buildMadridDeadlineIso(requestedAt: string, baseTime: string) {
+  const { year, month, day } = getMadridDateParts(requestedAt);
+  const deadlineMinutes = timeStringToMinutes(baseTime) + 45;
+
+  const hh = String(Math.floor(deadlineMinutes / 60)).padStart(2, "0");
+  const mm = String(deadlineMinutes % 60).padStart(2, "0");
+
+  return `${year}-${month}-${day}T${hh}:${mm}:00`;
+}
+
+function getTimeRequestFallbackIso(
+  reason: string,
+  requestedAt: string,
+  calendar: CalendarRow | null
+) {
+  if (!calendar) return requestedAt;
+
+  switch (reason) {
+    case "missing_checkin_incident":
+      return calendar.morning_start
+        ? buildMadridDeadlineIso(requestedAt, calendar.morning_start)
+        : requestedAt;
+
+    case "missing_lunch_checkout_incident":
+      return calendar.lunch_start
+        ? buildMadridDeadlineIso(requestedAt, calendar.lunch_start)
+        : requestedAt;
+
+    case "missing_afternoon_checkin_incident":
+      return calendar.afternoon_start
+        ? buildMadridDeadlineIso(requestedAt, calendar.afternoon_start)
+        : requestedAt;
+
+    case "missing_final_checkout_incident":
+      return calendar.day_end
+        ? buildMadridDeadlineIso(requestedAt, calendar.day_end)
+        : requestedAt;
+
+    default:
+      return requestedAt;
+  }
 }
 
 // ======================================================
 // PARTE 2/6 — COMPONENTE Y ESTADO
 // ======================================================
 
-export function WorkerPage() {
+export function AdminIncidentsPage() {
   const navigate = useNavigate();
+  const { membership } = useActiveMembership();
 
-  const [userId, setUserId] = useState<string | null>(null);
-  const { membership, loading: membershipLoading } = useActiveMembership();
+  const [incidents, setIncidents] = useState<Incident[]>([]);
 
-  useRegisterPushDevice(!!membership?.company_id);
+  // Antes, si una de las consultas fallaba, la tabla se quedaba vacía y
+  // decía "No hay incidencias pendientes". Ahora se distingue "no hay
+  // nada" de "no se ha podido cargar".
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [profilesById, setProfilesById] = useState<Record<string, Profile>>({});
+  const [loading, setLoading] = useState(false);
+  const [search, setSearch] = useState("");
 
-  const [history, setHistory] = useState<HistoryEntry[]>([]);
-  const [historyLoading, setHistoryLoading] = useState(false);
-  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [selectedIncident, setSelectedIncident] = useState<Incident | null>(null);
+  const [selectedEntryGeo, setSelectedEntryGeo] = useState<EntryGeoDetail | null>(null);
+  const [loadingEntryGeo, setLoadingEntryGeo] = useState(false);
+  const [resolutionReason, setResolutionReason] = useState("");
 
-  const [showAdjust, setShowAdjust] = useState(false);
-  const [adjustReason, setAdjustReason] = useState("");
-  const [tick, setTick] = useState(0);
+  const [finalCheckIn, setFinalCheckIn] = useState("");
+  const [finalCheckOut, setFinalCheckOut] = useState("");
 
-  // Error del último intento de fichar. Antes no existía: si el fichaje
-  // fallaba, el error se perdía por el camino y el trabajador se iba
-  // convencido de haber fichado.
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [resolving, setResolving] = useState(false);
 
-  // Bloqueo inmediato del botón. El estado "cargando" de la mutación
-  // tarda en activarse porque antes hay que esperar al GPS, y en esos
-  // segundos se podía pulsar dos veces y crear dos jornadas.
-  const pressingRef = useRef(false);
-  const [pressing, setPressing] = useState(false);
+const [validatedToday, setValidatedToday] = useState(0);
+const [rejectedToday, setRejectedToday] = useState(0);
 
-  const goalHours = 8;
-  const goalMinutes = goalHours * 60;
+  function getWorkerLabel(userId: string) {
+    const profile = profilesById[userId];
+    const fullName = (profile?.full_name ?? "").trim();
+    const email = (profile?.email ?? "").trim();
 
-  const activeCompany = membership?.company_id ?? null;
-  const {
-  data: openEntry,
-  isLoading,
-  refetch: refetchOpenEntry,
-} = useOpenEntry(activeCompany, userId);
-  const checkIn = useCheckIn(activeCompany, userId);
-  const checkOut = useCheckOut();
-  const createAdjustment = useCreateAdjustment();
+    if (fullName) return fullName;
+    if (email) return email;
+    return userId;
+  }
 
-  const today = useMemo(() => new Date(), []);
-  const isOpen = !!openEntry;
-
-  // ======================================================
-  // PARTE 3/6 — DATOS DERIVADOS
+   // ======================================================
+  // PARTE 3/6 — CARGA Y ACCIONES
   // ======================================================
 
-  const todayEntries = useMemo(() => {
-    const base = history
-      .filter((h) => isSameLocalDay(h.check_in_at, today))
-      .sort(
-        (a, b) =>
-          new Date(a.check_in_at).getTime() - new Date(b.check_in_at).getTime()
-      );
+  async function loadResolutionStats() {
+    if (!membership) return;
 
-    if (!openEntry || !isSameLocalDay(openEntry.check_in_at, today)) {
-      return base;
-    }
-
-    const alreadyIncluded = base.some((entry) => entry.id === openEntry.id);
-    if (alreadyIncluded) {
-      return base;
-    }
-
-    return [
-      ...base,
-      {
-        id: openEntry.id,
-        check_in_at: openEntry.check_in_at,
-        check_out_at: openEntry.check_out_at ?? null,
-        workflow_status: openEntry.workflow_status ?? "auto",
-      },
-    ].sort(
-      (a, b) =>
-        new Date(a.check_in_at).getTime() - new Date(b.check_in_at).getTime()
-    );
-  }, [history, today, openEntry]);
-
-  const lastTodayEntry = useMemo(() => {
-    if (todayEntries.length === 0) return null;
-    return todayEntries[todayEntries.length - 1];
-  }, [todayEntries]);
-
-  const adjustmentTarget = useMemo(() => {
-    if (openEntry) return openEntry;
-    if (lastTodayEntry) return lastTodayEntry;
-    return null;
-  }, [openEntry, lastTodayEntry]);
-
-    const requiresNewProposal =
-    adjustmentTarget?.workflow_status === "requires_new_proposal";
-
-   const isMainBlocked = false;
-  const isAdjustBlocked = false;
-
-  const topMessage = useMemo(() => {
-    if (!membership) {
-      return "No se ha detectado tu empresa. Cierra sesión y vuelve a entrar.";
-    }
-
-    if (requiresNewProposal) {
-      return "Tu ajuste fue rechazado. Envía una nueva propuesta.";
-    }
-
-    return "";
-  }, [membership, requiresNewProposal]);
-
-  const adjustmentHelpText = useMemo(() => {
-    if (openEntry) {
-      return "Estás ajustando la jornada abierta actual. Usa este campo solo si necesitas justificar una corrección.";
-    }
-    if (lastTodayEntry) {
-      return "Estás ajustando el último tramo de hoy. Explica claramente qué ha pasado.";
-    }
-    return "No hay ningún tramo disponible para ajustar.";
-  }, [openEntry, lastTodayEntry]);
-
-  const totalTodayMinutes = useMemo(() => {
-    void tick;
-    let total = 0;
-
-    for (const entry of todayEntries) {
-      total += minutesBetween(entry.check_in_at, entry.check_out_at);
-    }
-
-    return total;
-  }, [todayEntries, tick]);
-
-  const mainTime = useMemo(() => {
-    void tick;
-
-    if (isOpen && openEntry) {
-      return hhmmFromMinutes(minutesBetween(openEntry.check_in_at, null));
-    }
-
-    return hhmmFromMinutes(totalTodayMinutes);
-  }, [isOpen, openEntry, totalTodayMinutes, tick]);
-
-  const progress = useMemo(() => {
-    if (goalMinutes <= 0) return 0;
-    return Math.min(1, totalTodayMinutes / goalMinutes);
-  }, [totalTodayMinutes, goalMinutes]);
-
-  const isBusy =
-    pressing || (isOpen && checkOut.isPending) || (!isOpen && checkIn.isPending);
-
-  const mainLabel = isOpen ? "SALIR" : "ENTRAR";
-  const todayShown = todayEntries.slice(0, 2);
-
-  // ======================================================
-  // PARTE 4/6 — CARGA Y ACCIONES
-  // ======================================================
-
-  async function loadHistory() {
-    if (!activeCompany || !userId) return;
-
-    setHistoryLoading(true);
-    setHistoryError(null);
+    const { fromIso, toIsoExclusive } = getTodayRangeIso();
 
     const { data, error } = await supabase
       .from("time_entries")
-      .select("id,check_in_at,check_out_at,workflow_status")
-      .eq("company_id", activeCompany)
-      .eq("user_id", userId)
-      .order("check_in_at", { ascending: false })
-      .limit(50);
+      .select("workflow_status,approved_at,flags")
+      .eq("company_id", membership.company_id)
+      .in("workflow_status", ["adjusted", "rejected"]);
 
     if (error) {
-      setHistoryError(error.message);
-      setHistory([]);
-      setHistoryLoading(false);
+      setValidatedToday(0);
+      setRejectedToday(0);
       return;
     }
 
-    setHistory((data ?? []) as HistoryEntry[]);
-    setHistoryLoading(false);
-  }
+    const { data: requestRows } = await supabase
+      .from("time_entry_requests")
+      .select("status,resolved_at")
+      .eq("company_id", membership.company_id)
+      .in("status", ["validated", "rejected"]);
 
-  function describeError(err: unknown) {
-    const raw =
-      err instanceof Error ? err.message : typeof err === "string" ? err : "";
+    let validated = 0;
+    let rejected = 0;
 
-    if (raw.includes("Ya tienes una jornada abierta")) {
-      return "Ya tienes una jornada abierta sin cerrar. Ficha la salida antes de volver a entrar.";
-    }
-    if (raw.includes("No estas dado de alta") || raw.includes("No estás dado de alta")) {
-      return "Tu cuenta no está dada de alta en la empresa. Avisa a administración.";
-    }
-    if (raw.includes("ya estaba cerrada")) {
-      return "Esa jornada ya estaba cerrada. Recarga la aplicación para ver el estado real.";
-    }
-    if (raw.includes("dos tramos")) {
-      return "Ya has registrado los dos tramos de hoy. Avisa a administración para que lo corrija.";
-    }
-    if (raw.includes("Failed to fetch") || raw.includes("NetworkError")) {
-      return "No hay conexión. Tu fichaje NO se ha registrado. Inténtalo otra vez.";
-    }
+    for (const row of (data ?? []) as ResolutionStatsRow[]) {
+      const flagResolutionAt =
+        typeof row.flags?.admin_resolution_at === "string"
+          ? row.flags.admin_resolution_at
+          : null;
 
-    return raw
-      ? `No se ha podido registrar el fichaje: ${raw}`
-      : "No se ha podido registrar el fichaje. Inténtalo otra vez.";
-  }
+      const effectiveResolutionAt = flagResolutionAt ?? row.approved_at;
 
-  async function onMainPress() {
-    if (isMainBlocked || !activeCompany || !userId) return;
-
-    // Cortamos aquí el segundo toque, antes de esperar al GPS.
-    if (pressingRef.current) return;
-    pressingRef.current = true;
-    setPressing(true);
-    setActionError(null);
-
-    try {
-      const geo = await getCurrentPosition();
-
-      // Releer SIEMPRE el estado real justo antes de decidir
-      const { data: freshOpenEntry } = await refetchOpenEntry();
-
-      if (!freshOpenEntry) {
-        await checkIn.mutateAsync(geo);
-      } else {
-        await checkOut.mutateAsync({ entryId: freshOpenEntry.id, geo });
+      if (!isIsoWithinRange(effectiveResolutionAt, fromIso, toIsoExclusive)) {
+        continue;
       }
 
-      await loadHistory();
-      await refetchOpenEntry();
-    } catch (err) {
-      setActionError(describeError(err));
-      await refetchOpenEntry();
-    } finally {
-      pressingRef.current = false;
-      setPressing(false);
+      if (row.workflow_status === "adjusted") validated += 1;
+      if (row.workflow_status === "rejected") rejected += 1;
     }
+
+    for (const row of (requestRows ?? []) as Array<{ status: string; resolved_at: string | null }>) {
+      if (!isIsoWithinRange(row.resolved_at, fromIso, toIsoExclusive)) {
+        continue;
+      }
+
+      if (row.status === "validated") validated += 1;
+      if (row.status === "rejected") rejected += 1;
+    }
+
+    setValidatedToday(validated);
+    setRejectedToday(rejected);
   }
 
-  async function onSubmitAdjustment() {
-    if (!adjustmentTarget) return;
+  async function loadIncidents() {
+    if (!membership) return;
 
-    const reason = adjustReason.trim();
-    if (reason.length < 3) return;
+    setLoading(true);
+    setLoadError(null);
 
-    try {
-      await createAdjustment.mutateAsync({
-        timeEntryId: adjustmentTarget.id,
-        proposedCheckOut: new Date().toISOString(),
-        reason,
+    const { data: calendarData } = await supabase
+      .from("company_work_calendar")
+      .select("morning_start,lunch_start,afternoon_start,day_end")
+      .eq("company_id", membership.company_id)
+      .maybeSingle<CalendarRow>();
+
+    const { data: manualData, error: manualError } = await supabase.rpc(
+      "admin_pending_adjustments",
+      { p_company_id: membership.company_id },
+    );
+
+    if (manualError) {
+      setLoadError(manualError.message);
+      setIncidents([]);
+      setLoading(false);
+      return;
+    }
+
+    const manual: Incident[] =
+      ((manualData ?? []) as Omit<Incident, "source_type">[]).map((item) => ({
+        ...item,
+        source_type: "manual",
+      }));
+
+    const { data: autoRows, error: autoError } = await supabase
+      .from("time_entries")
+      .select("id,user_id,check_in_at,check_out_at,flags")
+      .eq("company_id", membership.company_id)
+      .eq("workflow_status", "pending");
+
+    if (autoError) {
+      setLoadError(autoError.message);
+      setIncidents([]);
+      setLoading(false);
+      return;
+    }
+
+    const automatic: Incident[] =
+      (autoRows ?? []).map((e: any) => ({
+        adjustment_id: `auto-${e.id}`,
+        time_entry_id: e.id,
+        user_id: e.user_id,
+        check_in_at: e.check_in_at,
+        proposed_check_out: e.check_out_at ?? e.check_in_at,
+        reason:
+          e.flags?.auto_incident_reason ??
+          "Incidencia automática detectada por el sistema",
+        created_at: e.check_in_at,
+        source_type: "automatic",
+      })) ?? [];
+
+    const { data: requestRows, error: requestError } = await supabase
+      .from("time_entry_requests")
+      .select("id,time_entry_id,requested_by,requested_at,reason,status")
+      .eq("company_id", membership.company_id)
+      .eq("status", "pending")
+      .returns<TimeRequestRow[]>();
+
+    if (requestError) {
+      setLoadError(requestError.message);
+      setIncidents([]);
+      setLoading(false);
+      return;
+    }
+
+    const requestTimeEntryIds = Array.from(
+      new Set(
+        (requestRows ?? [])
+          .map((row) => row.time_entry_id)
+          .filter((value): value is string => !!value)
+      )
+    );
+
+    const entriesById: Record<string, { check_in_at: string | null; check_out_at: string | null }> = {};
+
+    if (requestTimeEntryIds.length > 0) {
+      const { data: linkedEntries } = await supabase
+        .from("time_entries")
+        .select("id,check_in_at,check_out_at")
+        .in("id", requestTimeEntryIds);
+
+      for (const entry of linkedEntries ?? []) {
+        entriesById[entry.id] = {
+          check_in_at: entry.check_in_at,
+          check_out_at: entry.check_out_at,
+        };
+      }
+    }
+
+    const timeRequests: Incident[] =
+      (requestRows ?? []).map((row) => {
+        const linkedEntry = row.time_entry_id ? entriesById[row.time_entry_id] : null;
+        const fallbackDateTime = getTimeRequestFallbackIso(
+          row.reason,
+          row.requested_at,
+          calendarData ?? null
+        );
+
+        return {
+          adjustment_id: row.id,
+          time_entry_id: row.time_entry_id ?? "",
+          user_id: row.requested_by,
+          check_in_at: linkedEntry?.check_in_at ?? fallbackDateTime,
+          proposed_check_out:
+            linkedEntry?.check_out_at ?? linkedEntry?.check_in_at ?? fallbackDateTime,
+          reason: row.reason,
+          created_at: row.requested_at,
+          source_type: "time_request",
+        };
+      }) ?? [];
+
+    const combined = [...manual, ...automatic, ...timeRequests].sort(
+      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    );
+
+    setIncidents(combined);
+
+    const { data: profilesData } = await supabase.rpc("admin_company_profiles", {
+      p_company_id: membership.company_id,
+    });
+
+    const map: Record<string, Profile> = {};
+    for (const p of (profilesData ?? []) as Profile[]) {
+      map[p.id] = p;
+    }
+
+    setProfilesById(map);
+
+    await loadResolutionStats();
+    setLoading(false);
+  }
+
+  async function resolveIncident(decision: "validated" | "rejected") {
+    if (!selectedIncident) return;
+
+    const reason = resolutionReason.trim();
+
+    if (reason.length < 3) {
+      alert("El motivo de resolución es obligatorio (mínimo 3 caracteres).");
+      return;
+    }
+
+    // La salida tiene que ser posterior a la entrada. Sin esta
+    // comprobación se guardaban jornadas de duración cero o negativa,
+    // que después desaparecían de los totales de horas sin avisar.
+    if (decision === "validated" && !isTimeRequestIncident(selectedIncident)) {
+      const entrada = fromDateTimeLocalValue(finalCheckIn);
+      const salida = fromDateTimeLocalValue(finalCheckOut);
+
+      if (entrada && salida && new Date(salida) <= new Date(entrada)) {
+        alert(
+          "La hora de salida tiene que ser posterior a la de entrada.\n\n" +
+            "Si la jornada terminó al día siguiente, cambia también la fecha.",
+        );
+        return;
+      }
+    }
+
+    // Sin los datos del fichaje cargados, guardar borraría la ubicación,
+    // la distancia al centro y el motivo original de la incidencia.
+    if (
+      isAutomaticIncident(selectedIncident) &&
+      selectedIncident.time_entry_id &&
+      !selectedEntryGeo
+    ) {
+      alert(
+        "No se han podido cargar los datos del fichaje.\n\n" +
+          "Cierra la incidencia, recarga la página y vuelve a abrirla. " +
+          "Si se guarda ahora, se perderían la ubicación y el motivo original.",
+      );
+      return;
+    }
+
+    setResolving(true);
+
+    if (isTimeRequestIncident(selectedIncident)) {
+      const { error } = await supabase.rpc("resolve_time_entry_request", {
+        p_request_id: selectedIncident.adjustment_id,
+        p_decision: decision,
+        p_resolution_reason: reason,
       });
 
-      setAdjustReason("");
-      setActionError(null);
-      await loadHistory();
-    } catch (err) {
-      setActionError(
-        "No se ha podido enviar la solicitud. Inténtalo otra vez o avisa a administración.",
-      );
-      console.error(err);
+      setResolving(false);
+
+      if (error) {
+        alert(error.message);
+        return;
+      }
+
+      closeIncidentModal();
+      await loadIncidents();
+      return;
     }
+
+    if (isAutomaticIncident(selectedIncident)) {
+      const previousCheckOutAt =
+        selectedEntryGeo?.flags?.admin_new_check_out_at ?? selectedIncident.proposed_check_out;
+
+      const nextFlags = {
+        ...(selectedEntryGeo?.flags ?? {}),
+        admin_resolution_decision: decision,
+        admin_resolution_reason: reason,
+        admin_resolution_at: new Date().toISOString(),
+        incident_closed_from_backoffice: true,
+      };
+
+      const { data: authData } = await supabase.auth.getUser();
+      const adminUserId = authData.user?.id ?? null;
+
+      const updatePayload: Record<string, any> = {
+        workflow_status: decision === "validated" ? "adjusted" : "rejected",
+        flags: nextFlags,
+      };
+
+      if (decision === "validated") {
+        const nextCheckIn = fromDateTimeLocalValue(finalCheckIn);
+        const nextCheckOut = fromDateTimeLocalValue(finalCheckOut);
+
+        if (nextCheckIn) {
+          updatePayload.check_in_at = nextCheckIn;
+        }
+
+        if (nextCheckOut) {
+          updatePayload.check_out_at = nextCheckOut;
+        }
+      }
+
+      const { error } = await supabase
+        .from("time_entries")
+        .update(updatePayload)
+        .eq("id", selectedIncident.time_entry_id);
+
+      if (error) {
+        setResolving(false);
+        alert(error.message);
+        return;
+      }
+
+      await supabase.from("time_entry_logs").insert({
+        company_id: membership?.company_id,
+        time_entry_id: selectedIncident.time_entry_id,
+        action:
+          decision === "validated"
+            ? "automatic_incident_validated"
+            : "automatic_incident_rejected",
+        performed_by: adminUserId,
+        performed_role: "admin",
+        old_values: {
+          check_in_at: selectedIncident.check_in_at,
+          check_out_at: previousCheckOutAt,
+          workflow_status: "pending",
+        },
+        new_values: {
+          check_in_at:
+            fromDateTimeLocalValue(finalCheckIn) ?? selectedIncident.check_in_at,
+          check_out_at:
+            fromDateTimeLocalValue(finalCheckOut) ?? previousCheckOutAt,
+          workflow_status: decision === "validated" ? "adjusted" : "rejected",
+          resolution_reason: reason,
+        },
+      });
+
+      setResolving(false);
+      closeIncidentModal();
+      await loadIncidents();
+      return;
+    }
+
+    // ----------------------------------------------------
+    // INCIDENCIA MANUAL (pedida por el trabajador)
+    // ----------------------------------------------------
+    // La función de base de datos solo sabe corregir la SALIDA.
+    // Antes, la hora de entrada que escribía el administrador se
+    // descartaba en silencio: pulsaba validar, parecía que había
+    // funcionado, y la entrada seguía igual.
+    // Ahora la salida la sigue corrigiendo la función, y la
+    // entrada se aplica aquí y se deja registrada.
+
+    const nextCheckOut =
+      decision === "validated" ? fromDateTimeLocalValue(finalCheckOut) : null;
+
+    const nextCheckIn =
+      decision === "validated" ? fromDateTimeLocalValue(finalCheckIn) : null;
+
+    const { data: authData } = await supabase.auth.getUser();
+    const adminUserId = authData.user?.id ?? null;
+
+    const { error } = await supabase.rpc("resolve_time_entry_adjustment", {
+      p_adjustment_id: selectedIncident.adjustment_id,
+      p_decision: decision,
+      p_resolution_reason: reason,
+      p_final_check_out: nextCheckOut,
+    });
+
+    if (error) {
+      setResolving(false);
+      alert(error.message);
+      return;
+    }
+
+    const checkInChanged =
+      !!nextCheckIn && !sameInstant(nextCheckIn, selectedIncident.check_in_at);
+
+    if (checkInChanged && selectedIncident.time_entry_id) {
+      const { error: checkInError } = await supabase
+        .from("time_entries")
+        .update({ check_in_at: nextCheckIn })
+        .eq("id", selectedIncident.time_entry_id);
+
+      if (checkInError) {
+        setResolving(false);
+        alert(
+          "La salida se ha corregido, pero la entrada no: " +
+            checkInError.message,
+        );
+        return;
+      }
+
+      await supabase.from("time_entry_logs").insert({
+        company_id: membership?.company_id,
+        time_entry_id: selectedIncident.time_entry_id,
+        action: "check_in_corrected",
+        performed_by: adminUserId,
+        performed_role: "admin",
+        old_values: {
+          check_in_at: selectedIncident.check_in_at,
+        },
+        new_values: {
+          check_in_at: nextCheckIn,
+          resolution_reason: reason,
+        },
+      });
+    }
+
+    setResolving(false);
+
+    closeIncidentModal();
+    await loadIncidents();
+  }
+
+  async function openIncidentModal(item: Incident) {
+    setSelectedIncident(item);
+    setSelectedEntryGeo(null);
+    setLoadingEntryGeo(true);
+    setResolutionReason("");
+
+    // Convertidas a hora local. Antes se cortaba el texto en crudo
+    // y se colaba la hora UTC en un campo que se lee como local.
+    setFinalCheckIn(toDateTimeLocalValue(item.check_in_at));
+    setFinalCheckOut(toDateTimeLocalValue(item.proposed_check_out));
+
+    if (!item.time_entry_id) {
+      setSelectedEntryGeo(null);
+      setLoadingEntryGeo(false);
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from("time_entries")
+      .select(
+        "check_in_geo_lat, check_in_geo_lng, check_in_geo_accuracy_m, check_out_geo_lat, check_out_geo_lng, check_out_geo_accuracy_m, flags"
+      )
+      .eq("id", item.time_entry_id)
+      .maybeSingle();
+
+    if (!error && data) {
+      setSelectedEntryGeo(data as EntryGeoDetail);
+    } else {
+      setSelectedEntryGeo(null);
+    }
+
+    setLoadingEntryGeo(false);
+  }
+
+  function closeIncidentModal() {
+    setSelectedIncident(null);
+    setSelectedEntryGeo(null);
+    setLoadingEntryGeo(false);
+    setResolutionReason("");
+    setFinalCheckIn("");
+    setFinalCheckOut("");
   }
 
   // ======================================================
-  // PARTE 5/6 — EFECTOS Y ESTADOS BASE
+  // PARTE 4/6 — DERIVADOS Y EFECTOS
   // ======================================================
 
   useEffect(() => {
-  supabase.auth.getUser().then(({ data }) => {
-    setUserId(data.user?.id ?? null);
-  });
-
-  navigator.geolocation.getCurrentPosition(
-    () => {},
-    () => {},
-    {
-      enableHighAccuracy: true,
-      timeout: 5000,
-      maximumAge: 0,
-    }
-  );
-}, []);
-
-  useEffect(() => {
-    if (!activeCompany || !userId) return;
-    loadHistory();
+    if (!membership) return;
+    loadIncidents();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeCompany, userId]);
+  }, [membership?.company_id]);
 
-  useEffect(() => {
-    if (!openEntry) return;
-    const t = window.setInterval(() => setTick((x) => x + 1), 1000);
-    return () => window.clearInterval(t);
-  }, [openEntry]);
+  const filteredIncidents = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return incidents;
 
-  useEffect(() => {
-    if (requiresNewProposal) {
-      setShowAdjust(true);
-    }
-  }, [requiresNewProposal]);
+    return incidents.filter((item) => {
+      const workerLabel = getWorkerLabel(item.user_id).toLowerCase();
 
-  if (!userId) {
-    return (
-      <div
-        style={{
-          minHeight: "100vh",
-          padding: 24,
-          color: adminTheme.colors.text,
-          background: adminTheme.colors.pageBg,
-        }}
-      >
-        Cargando usuario...
-      </div>
-    );
-  }
+      return (
+        workerLabel.includes(q) ||
+        item.user_id.toLowerCase().includes(q) ||
+        String(item.reason ?? "").toLowerCase().includes(q)
+      );
+    });
+  }, [incidents, search, profilesById]);
 
-  if (membershipLoading) {
-    return (
-      <div
-        style={{
-          minHeight: "100vh",
-          padding: 24,
-          color: adminTheme.colors.text,
-          background: adminTheme.colors.pageBg,
-        }}
-      >
-        Cargando empresa...
-      </div>
-    );
-  }
+  const flags = selectedEntryGeo?.flags ?? null;
 
-  if (!membership) {
-    return (
-      <div
-        style={{
-          minHeight: "100vh",
-          padding: 24,
-          color: adminTheme.colors.text,
-          background: adminTheme.colors.pageBg,
-        }}
-      >
-        No hay empresa activa.
-      </div>
-    );
-  }
-
-  if (isLoading) {
-    return (
-      <div
-        style={{
-          minHeight: "100vh",
-          padding: 24,
-          color: adminTheme.colors.text,
-          background: adminTheme.colors.pageBg,
-        }}
-      >
-        Cargando estado...
-      </div>
-    );
-  }
-
-  // ======================================================
-  // PARTE 6/6 — UI DE LA PÁGINA
+   // ======================================================
+  // PARTE 5/6 — UI PRINCIPAL DE LA PÁGINA
   // ======================================================
 
   return (
-    <div
-      className="workerPageUi"
-      style={{
-        minHeight: "100vh",
-        width: "100%",
-        background: `linear-gradient(180deg, ${adminTheme.colors.primary} 0%, ${adminTheme.colors.primarySoft} 100%)`,
-        display: "flex",
-        justifyContent: "center",
-        padding: 10,
-      }}
-    >
+    <div className="adminIncPageUi">
       <style>{`
-        .workerPageUi * {
-          box-sizing: border-box;
-        }
-
-        .workerShell {
-          width: 100%;
-          max-width: 520px;
+        .adminIncPageUi {
           display: grid;
-          gap: 10px;
+          gap: 12px;
         }
 
-        .workerCard {
-          background: ${adminTheme.colors.panelBg};
-          border-radius: 22px;
+        .adminIncTopBar {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+          align-items: center;
+        }
+
+        .adminIncBadge {
+          height: 40px;
+          padding: 0 14px;
+          display: inline-flex;
+          align-items: center;
           border: 1px solid ${adminTheme.colors.border};
-          box-shadow: ${adminTheme.shadow.lg};
-          backdrop-filter: blur(6px);
-          padding: 14px;
-        }
-
-        .workerDate {
-          text-align: center;
-          font-size: 15px;
-          font-weight: 900;
-          color: ${adminTheme.colors.text};
-          text-transform: capitalize;
-        }
-
-        .workerMainTimeWrap {
-          text-align: center;
-          margin-top: 6px;
-        }
-
-        .workerMainTime {
-          font-size: 44px;
-          line-height: 1;
-          font-weight: 950;
-          letter-spacing: 1px;
-          color: ${adminTheme.colors.text};
-        }
-
-        .workerMainSub {
-          margin-top: 4px;
-          font-size: 12px;
+          border-radius: 12px;
+          background: ${adminTheme.colors.panelBg};
           color: ${adminTheme.colors.textSoft};
+          font-size: 13px;
           font-weight: 700;
         }
 
-        .workerProgressWrap {
-          margin-top: 10px;
-        }
-
-        .workerProgressLabels {
-          display: flex;
-          justify-content: space-between;
-          font-size: 11px;
-          color: ${adminTheme.colors.textSoft};
-          font-weight: 800;
-          margin-bottom: 5px;
-        }
-
-        .workerProgressBar {
-          height: 10px;
-          border-radius: ${adminTheme.radius.pill};
-          background: ${adminTheme.colors.panelAlt};
-          overflow: hidden;
-        }
-
-        .workerProgressValue {
-          height: 100%;
-          width: ${Math.round(progress * 100)}%;
-          background: linear-gradient(90deg, ${adminTheme.colors.primary} 0%, ${adminTheme.colors.primarySoft} 100%);
-        }
-
-        .workerMainButtonWrap {
-          margin-top: 12px;
-          display: flex;
-          justify-content: center;
-        }
-
-        .workerMainButton {
-          width: 184px;
-          height: 184px;
-          border-radius: 999px;
-          border: 3px solid rgba(255,255,255,0.28);
-          background: radial-gradient(circle at 30% 25%, rgba(255,255,255,0.34), rgba(255,255,255,0) 45%), ${
-            isOpen ? adminTheme.colors.danger : adminTheme.colors.success
-          };
-          color: ${adminTheme.colors.textOnPrimary};
-          cursor: ${isBusy || isMainBlocked ? "not-allowed" : "pointer"};
-          box-shadow: ${adminTheme.shadow.lg};
-          display: grid;
-          place-items: center;
-          opacity: ${isMainBlocked ? 0.65 : 1};
-          transform: ${isBusy ? "scale(0.995)" : "scale(1)"};
-          transition: transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
-        }
-
-        .workerMainButtonInner {
-          display: grid;
-          place-items: center;
-          gap: 8px;
-        }
-
-        .workerMainButtonInner svg {
-          width: 60px;
-          height: 60px;
-        }
-
-        .workerMainButtonLabel {
-          font-size: 20px;
-          font-weight: 950;
-          letter-spacing: 1px;
-          text-shadow: 0 8px 18px rgba(0,0,0,0.22);
-        }
-
-        .workerMessage {
-          margin-top: 12px;
-          padding: 10px;
-          border-radius: 14px;
-          font-weight: 800;
-          text-align: center;
+        .adminIncInput {
+          height: 40px;
+          padding: 0 12px;
           border: 1px solid ${adminTheme.colors.border};
+          border-radius: 12px;
+          background: ${adminTheme.colors.panelBg};
+          color: ${adminTheme.colors.text};
+          outline: none;
+          font-weight: 700;
+          min-width: 240px;
+        }
+
+        .adminIncInput::placeholder {
+          color: ${adminTheme.colors.textMuted};
+        }
+
+        .adminIncBtn {
+          height: 40px;
+          padding: 0 16px;
+          border: 1px solid ${adminTheme.colors.border};
+          border-radius: 12px;
           background: ${adminTheme.colors.panelSoft};
+          color: ${adminTheme.colors.text};
+          font-weight: 700;
+          cursor: pointer;
+        }
+
+        .adminIncBtn.primary {
+          background: ${adminTheme.colors.primary};
+          color: ${adminTheme.colors.textOnPrimary};
+          border-color: ${adminTheme.colors.primary};
+        }
+
+        .adminIncBtn.danger {
+          background: ${adminTheme.colors.danger};
+          color: #ffffff;
+          border-color: ${adminTheme.colors.dangerHover};
+        }
+
+        .adminIncBtn:disabled {
+          opacity: .6;
+          cursor: not-allowed;
+        }
+
+        .adminIncKpiGrid {
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 12px;
+        }
+
+        .adminIncKpi {
+          border: 1px solid ${adminTheme.colors.border};
+          border-radius: 18px;
+          background: ${adminTheme.colors.cardBg};
+          padding: 16px;
+        }
+
+        .adminIncKpiLabel {
+          font-size: 13px;
+          font-weight: 700;
+          color: ${adminTheme.colors.textSoft};
+        }
+
+        .adminIncKpiValue {
+          margin-top: 8px;
+          font-size: 26px;
+          font-weight: 800;
           color: ${adminTheme.colors.text};
         }
 
-        .workerMessage.error {
-          background: ${adminTheme.colors.dangerSoft};
-          border-color: ${adminTheme.colors.danger};
-          color: ${adminTheme.colors.danger};
+        .adminIncCard {
+          border: 1px solid ${adminTheme.colors.border};
+          border-radius: 18px;
+          background: ${adminTheme.colors.cardBg};
+          padding: 16px;
         }
 
-        .workerTodayHead {
+        .adminIncCardTitle {
+          margin: 0;
+          font-size: 18px;
+          font-weight: 800;
+          color: ${adminTheme.colors.text};
+        }
+
+        .adminIncCardSub {
+          margin: 4px 0 0 0;
+          font-size: 13px;
+          font-weight: 600;
+          color: ${adminTheme.colors.textSoft};
+        }
+
+        .adminIncTableWrap {
+          margin-top: 12px;
+          overflow: auto;
+          border: 1px solid ${adminTheme.colors.border};
+          border-radius: 14px;
+          background: ${adminTheme.colors.panelBg};
+        }
+
+        .adminIncTable {
+          width: 100%;
+          border-collapse: collapse;
+          min-width: 980px;
+        }
+
+        .adminIncTable th,
+        .adminIncTable td {
+          padding: 12px;
+          text-align: left;
+          border-bottom: 1px solid ${adminTheme.colors.border};
+          font-size: 14px;
+          color: ${adminTheme.colors.text};
+          vertical-align: middle;
+        }
+
+        .adminIncTable th {
+          color: ${adminTheme.colors.textSoft};
+          font-weight: 800;
+        }
+
+        .adminIncRight {
+          text-align: right;
+        }
+
+        .adminIncEmpty {
+          padding: 24px 12px;
+          text-align: center;
+          color: ${adminTheme.colors.textSoft};
+          font-weight: 600;
+        }
+
+        .adminIncModalOverlay {
+          position: fixed;
+          inset: 0;
+          background: ${adminTheme.colors.overlay};
           display: flex;
-          align-items: baseline;
+          align-items: center;
+          justify-content: center;
+          padding: 18px;
+          z-index: 9999;
+        }
+
+        .adminIncModalCard {
+          width: min(1680px, 100%);
+          min-height: min(900px, calc(100vh - 36px));
+          border: 1px solid ${adminTheme.colors.border};
+          border-radius: 24px;
+          background: ${adminTheme.colors.cardBg};
+          padding: 18px;
+          box-shadow: ${adminTheme.shadows.lg};
+          overflow: hidden;
+          display: grid;
+          grid-template-rows: auto 1fr;
+          gap: 14px;
+        }
+
+        .adminIncModalHeader {
+          display: flex;
+          align-items: center;
           justify-content: space-between;
           gap: 12px;
         }
 
-        .workerTodayTitle {
-          font-weight: 950;
-          font-size: 15px;
-          color: ${adminTheme.colors.text};
-        }
-
-        .workerTodayTotal {
+        .adminIncModalTitle {
+          margin: 0;
+          font-size: 24px;
           font-weight: 900;
           color: ${adminTheme.colors.text};
-          font-size: 14px;
         }
 
-        .workerMuted {
-          margin-top: 8px;
-          color: ${adminTheme.colors.textSoft};
+        .adminIncModalSub {
           font-size: 13px;
+          font-weight: 700;
+          color: ${adminTheme.colors.textSoft};
         }
 
-        .workerEntries {
-          margin-top: 10px;
+        .adminIncModalShell {
           display: grid;
-          gap: 8px;
+          grid-template-columns: 320px minmax(0, 1fr) 320px;
+          gap: 14px;
+          min-height: 0;
         }
 
-        .workerEntryCard {
-          border-radius: 18px;
-          padding: 10px;
+        .adminIncSideCol,
+        .adminIncCenterCol,
+        .adminIncRightCol {
+          min-height: 0;
+        }
+
+        .adminIncSideCol,
+        .adminIncRightCol {
+          display: grid;
+          gap: 12px;
+          align-content: start;
+        }
+
+        .adminIncCenterCol {
+          display: grid;
+          gap: 12px;
+          min-height: 0;
+        }
+
+        .adminIncPanel {
           border: 1px solid ${adminTheme.colors.border};
-          background: ${adminTheme.colors.panelSoft};
-          box-shadow: ${adminTheme.shadow.sm};
-          display: grid;
-          gap: 8px;
-        }
-
-        .workerEntryTitle {
-          font-weight: 950;
-          color: ${adminTheme.colors.text};
-          font-size: 15px;
-        }
-
-        .workerEntryGrid {
-          display: grid;
-          grid-template-columns: 1fr 1fr 1fr;
-          gap: 8px;
-        }
-
-        .workerEntryMini {
-          background: ${adminTheme.colors.panelBg};
           border-radius: 16px;
-          padding: 10px 8px;
-          text-align: center;
-          border: 1px solid ${adminTheme.colors.border};
-          min-width: 0;
+          background: ${adminTheme.colors.panelBg};
+          padding: 14px;
         }
 
-        .workerEntryMiniLabel {
-          font-size: 11px;
-          color: ${adminTheme.colors.textMuted};
-          font-weight: 800;
-        }
-
-        .workerEntryMiniValue {
-          font-size: 16px;
-          font-weight: 950;
+        .adminIncPanelTitle {
+          margin: 0 0 10px 0;
+          font-size: 15px;
+          font-weight: 900;
           color: ${adminTheme.colors.text};
-          line-height: 1.1;
-          margin-top: 2px;
-          word-break: break-word;
         }
 
-        .workerBottomCard {
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          gap: 8px;
-          padding-top: 12px;
-          padding-bottom: 12px;
-        }
-
-        .workerAdjustCard {
+        .adminIncInfoList {
           display: grid;
           gap: 10px;
         }
 
-        .workerAdjustTitle {
-          font-weight: 950;
-          color: ${adminTheme.colors.text};
-        }
-
-        .workerAdjustHelp {
-          font-size: 12px;
-          color: ${adminTheme.colors.textSoft};
-          line-height: 1.45;
-          font-weight: 700;
-        }
-
-        .workerAdjustInput {
-          width: 100%;
-          padding: 14px;
-          border-radius: 16px;
+        .adminIncInfoItem {
+          padding: 12px;
           border: 1px solid ${adminTheme.colors.border};
+          border-radius: 14px;
+          background: ${adminTheme.colors.panelSoft};
+        }
+
+        .adminIncInfoLabel {
+          font-size: 11px;
+          font-weight: 800;
+          color: ${adminTheme.colors.textMuted};
+          margin-bottom: 5px;
+          text-transform: uppercase;
+          letter-spacing: .02em;
+        }
+
+        .adminIncInfoValue {
           font-size: 15px;
-          outline: none;
+          font-weight: 800;
+          color: ${adminTheme.colors.text};
+          word-break: break-word;
+        }
+
+        .adminIncEditGrid {
+          display: grid;
+          gap: 10px;
+        }
+
+        .adminIncModalInput,
+        .adminIncModalTextarea {
+          width: 100%;
+          border: 1px solid ${adminTheme.colors.border};
+          border-radius: 12px;
           background: ${adminTheme.colors.panelSoft};
           color: ${adminTheme.colors.text};
-          box-sizing: border-box;
+          outline: none;
+          font-weight: 700;
+          padding: 10px 12px;
         }
 
-        .workerAdjustInput::placeholder {
+        .adminIncModalTextarea::placeholder,
+        .adminIncModalInput::placeholder {
           color: ${adminTheme.colors.textMuted};
         }
 
-        .workerAdjustBtn {
-          width: 100%;
+        .adminIncModalTextarea {
+          min-height: 220px;
+          resize: none;
+        }
+
+        .adminIncContextBar {
+          display: grid;
+          gap: 8px;
+        }
+
+        .adminIncContextStrip {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          flex-wrap: wrap;
           padding: 14px;
-          border-radius: 16px;
-          border: 1px solid ${adminTheme.colors.primary};
+          border-radius: 14px;
+          background: ${adminTheme.colors.panelSoft};
+          border: 1px solid ${adminTheme.colors.border};
+        }
+
+        .adminIncContextDot {
+          width: 10px;
+          height: 10px;
+          border-radius: 999px;
           background: ${adminTheme.colors.primary};
-          color: ${adminTheme.colors.textOnPrimary};
+          flex: 0 0 auto;
+        }
+
+        .adminIncContextText {
+          font-size: 14px;
+          font-weight: 700;
+          color: ${adminTheme.colors.text};
+        }
+
+        .adminIncGeoGrid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 14px;
+          min-height: 0;
+        }
+
+        .adminIncGeoCard {
+          display: grid;
+          gap: 12px;
+          padding: 14px;
+          border: 1px solid ${adminTheme.colors.border};
+          border-radius: 16px;
+          background: ${adminTheme.colors.panelBg};
+          min-height: 0;
+        }
+
+        .adminIncGeoCardHead {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+        }
+
+        .adminIncGeoCardTitle {
           font-size: 15px;
-          font-weight: 950;
-          cursor: pointer;
-          box-shadow: ${adminTheme.shadow.sm};
-        }
-
-        .workerAdjustBtn:disabled {
-          opacity: 0.7;
-          cursor: not-allowed;
-        }
-
-        .workerErrorText {
-          color: ${adminTheme.colors.danger};
-          font-size: 13px;
-        }
-
-        .workerSuccessText {
-          color: ${adminTheme.colors.success};
-          font-size: 13px;
           font-weight: 900;
+          color: ${adminTheme.colors.text};
         }
 
-        @media (max-width: 560px) {
-          .workerPageUi {
-            padding: 8px;
+        .adminIncGeoCardBadge {
+          display: inline-flex;
+          align-items: center;
+          height: 28px;
+          padding: 0 10px;
+          border-radius: 999px;
+          background: ${adminTheme.colors.primarySoft};
+          border: 1px solid ${adminTheme.colors.primaryBorder};
+          color: ${adminTheme.colors.primary};
+          font-size: 12px;
+          font-weight: 800;
+        }
+
+        .adminIncGeoMetaGrid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 10px;
+        }
+
+        .adminIncGeoMetaItem {
+          padding: 10px 12px;
+          border-radius: 12px;
+          background: ${adminTheme.colors.panelSoft};
+          border: 1px solid ${adminTheme.colors.border};
+        }
+
+        .adminIncGeoMetaLabel {
+          font-size: 11px;
+          font-weight: 800;
+          color: ${adminTheme.colors.textMuted};
+          margin-bottom: 4px;
+          text-transform: uppercase;
+          letter-spacing: .02em;
+        }
+
+        .adminIncGeoMetaValue {
+          font-size: 13px;
+          font-weight: 700;
+          color: ${adminTheme.colors.text};
+          word-break: break-word;
+        }
+
+        .adminIncMapFrame {
+          width: 100%;
+          height: 320px;
+          border: 0;
+          border-radius: 14px;
+          background: ${adminTheme.colors.panelSoft};
+        }
+
+        .adminIncMapLink {
+          color: ${adminTheme.colors.link};
+          font-size: 13px;
+          font-weight: 700;
+          text-decoration: none;
+        }
+
+        .adminIncMapLink:hover {
+          text-decoration: underline;
+        }
+
+        .adminIncActionText {
+          font-size: 14px;
+          font-weight: 700;
+          color: ${adminTheme.colors.textSoft};
+          line-height: 1.45;
+        }
+
+        @media (max-width: 1380px) {
+          .adminIncModalCard {
+            min-height: auto;
+            overflow: auto;
           }
 
-          .workerShell {
-            gap: 8px;
+          .adminIncModalShell {
+            grid-template-columns: 1fr;
           }
 
-          .workerCard {
-            padding: 12px;
+          .adminIncGeoGrid {
+            grid-template-columns: 1fr;
           }
 
-          .workerMainTime {
-            font-size: 38px;
+          .adminIncModalTextarea {
+            min-height: 160px;
+          }
+        }
+
+        @media (max-width: 900px) {
+          .adminIncKpiGrid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
           }
 
-          .workerMainButton {
-            width: 160px;
-            height: 160px;
+          .adminIncGeoMetaGrid {
+            grid-template-columns: 1fr;
           }
 
-          .workerMainButtonInner svg {
-            width: 56px;
-            height: 56px;
+          .adminIncMapFrame {
+            height: 260px;
+          }
+        }
+
+        @media (max-width: 700px) {
+          .adminIncKpiGrid {
+            grid-template-columns: 1fr;
           }
 
-          .workerMainButtonLabel {
-            font-size: 17px;
+          .adminIncInput {
+            min-width: 100%;
           }
 
-          .workerEntryGrid {
-            grid-template-columns: 1fr 1fr 1fr;
-            gap: 6px;
-          }
-
-          .workerEntryMini {
-            padding: 8px 6px;
-            border-radius: 14px;
-          }
-
-          .workerEntryMiniLabel {
-            font-size: 10px;
-          }
-
-          .workerEntryMiniValue {
-            font-size: 14px;
-          }
-
-          .workerBottomCard {
-            gap: 6px;
-          }
-
-          .workerBottomCard button {
-            width: 56px !important;
-            height: 56px !important;
-            border-radius: 16px !important;
-          }
-
-          .workerBottomCard button svg {
-            width: 24px;
-            height: 24px;
+          .adminIncModalCard {
+            padding: 14px;
           }
         }
       `}</style>
 
-      <div className="workerShell">
-        <section className="workerCard">
-          <div className="workerDate">{formatLongDateEs(today)}</div>
+      <section className="adminIncTopBar">
+        <div className="adminIncBadge">Pendientes</div>
 
-          <div className="workerMainTimeWrap">
-            <div className="workerMainTime">{mainTime}</div>
-            <div className="workerMainSub">
-              {isOpen ? "Jornada en curso" : "Trabajado hoy"}
-            </div>
+        <input
+          className="adminIncInput"
+          placeholder="Buscar trabajador..."
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
 
-            <div className="workerProgressWrap">
-              <div className="workerProgressLabels">
-                <span>0h</span>
-                <span>{goalHours}h</span>
-              </div>
+        <button className="adminIncBtn" onClick={loadIncidents}>
+          Filtrar
+        </button>
+      </section>
 
-              <div className="workerProgressBar">
-                <div className="workerProgressValue" />
-              </div>
-            </div>
+      <section className="adminIncKpiGrid">
+        <div className="adminIncKpi">
+          <div className="adminIncKpiLabel">Incidencias pendientes</div>
+          <div className="adminIncKpiValue">{incidents.length}</div>
+        </div>
+
+        <div className="adminIncKpi">
+          <div className="adminIncKpiLabel">Validadas hoy</div>
+          <div className="adminIncKpiValue">{validatedToday}</div>
+        </div>
+
+        <div className="adminIncKpi">
+          <div className="adminIncKpiLabel">Rechazadas hoy</div>
+          <div className="adminIncKpiValue">{rejectedToday}</div>
+        </div>
+
+        <div className="adminIncKpi">
+          <div className="adminIncKpiLabel">Total incidencias</div>
+          <div className="adminIncKpiValue">
+            {incidents.length + validatedToday + rejectedToday}
           </div>
+        </div>
+      </section>
 
-          <div className="workerMainButtonWrap">
-            <button
-              className="workerMainButton"
-              onClick={onMainPress}
-              disabled={isBusy || isMainBlocked}
-            >
-              <div className="workerMainButtonInner">
-                <BracketArrowIcon direction={isOpen ? "out" : "in"} />
-                <div className="workerMainButtonLabel">{isBusy ? "…" : mainLabel}</div>
+      <section className="adminIncCard">
+        <h2 className="adminIncCardTitle">Incidencias</h2>
+        <p className="adminIncCardSub">Bandeja de incidencias pendientes</p>
+
+        <div className="adminIncTableWrap">
+          <table className="adminIncTable">
+            <thead>
+              <tr>
+                <th>Tipo</th>
+                <th>Trabajador</th>
+                <th>Entrada</th>
+                <th>Salida propuesta</th>
+                <th>Motivo</th>
+                <th className="adminIncRight">Acciones</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredIncidents.map((item) => (
+                <tr key={item.adjustment_id}>
+                  <td>{getIncidentTypeLabel(item.source_type)}</td>
+                  <td>{getWorkerLabel(item.user_id)}</td>
+                  <td>{formatDateTime(item.check_in_at)}</td>
+                  <td>{formatDateTime(item.proposed_check_out)}</td>
+                  <td>{formatReason(item.reason)}</td>
+                  <td className="adminIncRight">
+                    <button className="adminIncBtn primary" onClick={() => openIncidentModal(item)}>
+                      {item.source_type === "automatic"
+                        ? "Revisar"
+                        : item.source_type === "time_request"
+                        ? "Resolver"
+                        : "Resolver"}
+                    </button>
+                  </td>
+                </tr>
+              ))}
+
+              {!loading && loadError && (
+                <tr>
+                  <td
+                    colSpan={6}
+                    className="adminIncEmpty"
+                    style={{
+                      color: adminTheme.colors.danger,
+                      background: adminTheme.colors.dangerSoft,
+                      fontWeight: 700,
+                    }}
+                  >
+                    No se han podido cargar las incidencias. Puede haber
+                    incidencias pendientes que no se están mostrando. Recarga la
+                    página y, si sigue igual, avisa antes de dar el día por
+                    revisado.
+                    <div style={{ fontWeight: 500, marginTop: 6, fontSize: 12 }}>
+                      Detalle técnico: {loadError}
+                    </div>
+                  </td>
+                </tr>
+              )}
+
+              {!loading && !loadError && filteredIncidents.length === 0 && (
+                <tr>
+                  <td colSpan={6} className="adminIncEmpty">
+                    No hay incidencias pendientes.
+                  </td>
+                </tr>
+              )}
+
+              {loading && (
+                <tr>
+                  <td colSpan={6} className="adminIncEmpty">
+                    Cargando…
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      {selectedIncident && (
+        <div
+          className="adminIncModalOverlay"
+          onClick={() => {
+            if (resolving) return;
+            closeIncidentModal();
+          }}
+        >
+          <div className="adminIncModalCard" onClick={(e) => e.stopPropagation()}>
+            <div className="adminIncModalHeader">
+              <div>
+                <h3 className="adminIncModalTitle">
+                  {isTimeRequestIncident(selectedIncident)
+                    ? "Resolución de incidencia por tramos"
+                    : isAutomaticIncident(selectedIncident)
+                    ? "Revisión de incidencia automática"
+                    : "Resolución de incidencia manual"}
+                </h3>
+                <div className="adminIncModalSub">
+                  {isTimeRequestIncident(selectedIncident)
+                    ? "Incidencia creada automáticamente por faltar o llegar tarde en un tramo del día"
+                    : isAutomaticIncident(selectedIncident)
+                    ? "Inspección completa del fichaje, sus flags y la geolocalización detectada"
+                    : "Revisión completa de la solicitud manual y su geolocalización"}
+                </div>
               </div>
-            </button>
-          </div>
-
-          {actionError && (
-            <div className="workerMessage error" role="alert">
-              {actionError}
-              <button
-                type="button"
-                onClick={() => setActionError(null)}
-                style={{
-                  display: "block",
-                  margin: "10px auto 0",
-                  border: "none",
-                  background: "transparent",
-                  color: "inherit",
-                  font: "inherit",
-                  fontWeight: 800,
-                  textDecoration: "underline",
-                  cursor: "pointer",
-                }}
-              >
-                Entendido
-              </button>
             </div>
-          )}
 
-          {!actionError && (topMessage || historyError) && (
-            <div className={`workerMessage ${historyError ? "error" : ""}`}>
-              {historyError ? historyError : topMessage}
-            </div>
-          )}
-        </section>
+            <div className="adminIncModalShell">
+              <aside className="adminIncSideCol">
+                <div className="adminIncPanel">
+                  <h4 className="adminIncPanelTitle">Incidencia</h4>
 
-        <section className="workerCard">
-          <div className="workerTodayHead">
-            <div className="workerTodayTitle">Hoy</div>
-            <div className="workerTodayTotal">
-              Total: {hhmmFromMinutes(totalTodayMinutes)}
-            </div>
-          </div>
-
-          {historyLoading && <div className="workerMuted">Cargando…</div>}
-
-          {!historyLoading && todayEntries.length === 0 && (
-            <div className="workerMuted">Sin registros hoy.</div>
-          )}
-
-          {!historyLoading && todayEntries.length > 0 && (
-            <div className="workerEntries">
-              {todayShown.map((e, idx) => {
-                const mins = minutesBetween(e.check_in_at, e.check_out_at);
-
-                return (
-                  <div key={e.id} className="workerEntryCard">
-                    <div className="workerEntryTitle">Tramo {idx + 1}</div>
-
-                    <div className="workerEntryGrid">
-                      <div className="workerEntryMini">
-                        <div className="workerEntryMiniLabel">Entrada</div>
-                        <div className="workerEntryMiniValue">{formatHHMM(e.check_in_at)}</div>
+                  <div className="adminIncInfoList">
+                    <div className="adminIncInfoItem">
+                      <div className="adminIncInfoLabel">Tipo</div>
+                      <div className="adminIncInfoValue">
+                        {getIncidentTypeLabel(selectedIncident.source_type)}
                       </div>
+                    </div>
 
-                      <div className="workerEntryMini">
-                        <div className="workerEntryMiniLabel">Salida</div>
-                        <div className="workerEntryMiniValue">
-                          {e.check_out_at ? formatHHMM(e.check_out_at) : "—"}
-                        </div>
+                    <div className="adminIncInfoItem">
+                      <div className="adminIncInfoLabel">Trabajador</div>
+                      <div className="adminIncInfoValue">
+                        {getWorkerLabel(selectedIncident.user_id)}
                       </div>
+                    </div>
 
-                      <div className="workerEntryMini">
-                        <div className="workerEntryMiniLabel">Tiempo</div>
-                        <div className="workerEntryMiniValue">{hhmmFromMinutes(mins)}</div>
+                    <div className="adminIncInfoItem">
+                      <div className="adminIncInfoLabel">Entrada actual</div>
+                      <div className="adminIncInfoValue">
+                        {formatDateTime(selectedIncident.check_in_at)}
+                      </div>
+                    </div>
+
+                    <div className="adminIncInfoItem">
+                      <div className="adminIncInfoLabel">Salida actual</div>
+                      <div className="adminIncInfoValue">
+                        {formatDateTime(selectedIncident.proposed_check_out)}
+                      </div>
+                    </div>
+
+                    <div className="adminIncInfoItem">
+                      <div className="adminIncInfoLabel">Motivo de la incidencia</div>
+                      <div className="adminIncInfoValue">
+                        {formatReason(selectedIncident.reason)}
                       </div>
                     </div>
                   </div>
-                );
-              })}
-
-              {todayEntries.length > 2 && (
-                <div className="workerMuted">
-                  (Hay más tramos hoy. Se verán en “Histórico”.)
                 </div>
-              )}
+
+                {!isTimeRequestIncident(selectedIncident) && (
+                  <div className="adminIncPanel">
+                    <h4 className="adminIncPanelTitle">Corrección del tramo</h4>
+
+                    <div className="adminIncEditGrid">
+                      <div>
+                        <div className="adminIncInfoLabel" style={{ marginBottom: 6 }}>
+                          Hora entrada corregida
+                        </div>
+                        <input
+                          className="adminIncModalInput"
+                          type="datetime-local"
+                          value={finalCheckIn}
+                          onChange={(e) => setFinalCheckIn(e.target.value)}
+                        />
+                      </div>
+
+                      <div>
+                        <div className="adminIncInfoLabel" style={{ marginBottom: 6 }}>
+                          Hora salida corregida
+                        </div>
+                        <input
+                          className="adminIncModalInput"
+                          type="datetime-local"
+                          value={finalCheckOut}
+                          onChange={(e) => setFinalCheckOut(e.target.value)}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </aside>
+
+              <main className="adminIncCenterCol">
+                <div className="adminIncPanel">
+                  <h4 className="adminIncPanelTitle">Contexto del día</h4>
+
+                  <div className="adminIncContextBar">
+                    <div className="adminIncContextStrip">
+                      <span className="adminIncContextDot" />
+                      <span className="adminIncContextText">
+                        Tramo afectado: {formatDateTime(selectedIncident.check_in_at)} →{" "}
+                        {formatDateTime(selectedIncident.proposed_check_out)}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="adminIncPanel" style={{ minHeight: 0 }}>
+                  <h4 className="adminIncPanelTitle">Geolocalización</h4>
+
+                  {isTimeRequestIncident(selectedIncident) && !selectedIncident.time_entry_id && (
+                    <div className="adminIncActionText">
+                      Esta incidencia por tramos no tiene un fichaje enlazado todavía.
+                    </div>
+                  )}
+
+                  {loadingEntryGeo && <div className="adminIncActionText">Cargando ubicación…</div>}
+
+                  {!loadingEntryGeo &&
+                    !selectedEntryGeo &&
+                    !(isTimeRequestIncident(selectedIncident) && !selectedIncident.time_entry_id) && (
+                      <div className="adminIncActionText">
+                        No se ha podido cargar la ubicación.
+                      </div>
+                    )}
+
+                  {!loadingEntryGeo && selectedEntryGeo && (
+                    <div className="adminIncGeoGrid">
+                      <div className="adminIncGeoCard">
+                        <div className="adminIncGeoCardHead">
+                          <div className="adminIncGeoCardTitle">Entrada</div>
+                          <div className="adminIncGeoCardBadge">Check-in</div>
+                        </div>
+
+                        {selectedEntryGeo.check_in_geo_lat != null &&
+                        selectedEntryGeo.check_in_geo_lng != null ? (
+                          <>
+                            <div className="adminIncGeoMetaGrid">
+                              <div className="adminIncGeoMetaItem">
+                                <div className="adminIncGeoMetaLabel">Coordenadas</div>
+                                <div className="adminIncGeoMetaValue">
+                                  {formatCoords(
+                                    selectedEntryGeo.check_in_geo_lat,
+                                    selectedEntryGeo.check_in_geo_lng
+                                  )}
+                                </div>
+                              </div>
+
+                              <div className="adminIncGeoMetaItem">
+                                <div className="adminIncGeoMetaLabel">Precisión</div>
+                                <div className="adminIncGeoMetaValue">
+                                  {selectedEntryGeo.check_in_geo_accuracy_m != null
+                                    ? `${Math.round(selectedEntryGeo.check_in_geo_accuracy_m)} m`
+                                    : "No disponible"}
+                                </div>
+                              </div>
+
+                              <div className="adminIncGeoMetaItem">
+                                <div className="adminIncGeoMetaLabel">Distancia al centro</div>
+                                <div className="adminIncGeoMetaValue">
+                                  {formatDistance(flags?.check_in_geo_distance_to_workplace_m)}
+                                </div>
+                              </div>
+
+                              <div className="adminIncGeoMetaItem">
+                                <div className="adminIncGeoMetaLabel">¿Fuera del centro?</div>
+                                <div className="adminIncGeoMetaValue">
+                                  {formatBool(flags?.check_in_geo_outside_workplace)}
+                                </div>
+                              </div>
+
+                              <div className="adminIncGeoMetaItem">
+                                <div className="adminIncGeoMetaLabel">¿Evaluable?</div>
+                                <div className="adminIncGeoMetaValue">
+                                  {formatBool(flags?.check_in_geo_can_evaluate_workplace)}
+                                </div>
+                              </div>
+
+                              <div className="adminIncGeoMetaItem">
+                                <div className="adminIncGeoMetaLabel">Motivo</div>
+                                <div className="adminIncGeoMetaValue">
+                                  {formatReason(flags?.check_in_geo_reason)}
+                                </div>
+                              </div>
+                            </div>
+
+                            <iframe
+                              className="adminIncMapFrame"
+                              src={buildGoogleMapsEmbedUrl(
+                                selectedEntryGeo.check_in_geo_lat,
+                                selectedEntryGeo.check_in_geo_lng
+                              )}
+                              loading="lazy"
+                              referrerPolicy="no-referrer-when-downgrade"
+                              title="Mapa de entrada"
+                            />
+
+                            <a
+                              className="adminIncMapLink"
+                              href={buildGoogleMapsExternalUrl(
+                                selectedEntryGeo.check_in_geo_lat,
+                                selectedEntryGeo.check_in_geo_lng
+                              )}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              Ver ubicación exacta
+                            </a>
+                          </>
+                        ) : (
+                          <div className="adminIncActionText">
+                            No hay geolocalización registrada en la entrada.
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="adminIncGeoCard">
+                        <div className="adminIncGeoCardHead">
+                          <div className="adminIncGeoCardTitle">Salida</div>
+                          <div className="adminIncGeoCardBadge">Check-out</div>
+                        </div>
+
+                        {selectedEntryGeo.check_out_geo_lat != null &&
+                        selectedEntryGeo.check_out_geo_lng != null ? (
+                          <>
+                            <div className="adminIncGeoMetaGrid">
+                              <div className="adminIncGeoMetaItem">
+                                <div className="adminIncGeoMetaLabel">Coordenadas</div>
+                                <div className="adminIncGeoMetaValue">
+                                  {formatCoords(
+                                    selectedEntryGeo.check_out_geo_lat,
+                                    selectedEntryGeo.check_out_geo_lng
+                                  )}
+                                </div>
+                              </div>
+
+                              <div className="adminIncGeoMetaItem">
+                                <div className="adminIncGeoMetaLabel">Precisión</div>
+                                <div className="adminIncGeoMetaValue">
+                                  {selectedEntryGeo.check_out_geo_accuracy_m != null
+                                    ? `${Math.round(selectedEntryGeo.check_out_geo_accuracy_m)} m`
+                                    : "No disponible"}
+                                </div>
+                              </div>
+
+                              <div className="adminIncGeoMetaItem">
+                                <div className="adminIncGeoMetaLabel">Distancia al centro</div>
+                                <div className="adminIncGeoMetaValue">
+                                  {formatDistance(flags?.check_out_geo_distance_to_workplace_m)}
+                                </div>
+                              </div>
+
+                              <div className="adminIncGeoMetaItem">
+                                <div className="adminIncGeoMetaLabel">¿Fuera del centro?</div>
+                                <div className="adminIncGeoMetaValue">
+                                  {formatBool(flags?.check_out_geo_outside_workplace)}
+                                </div>
+                              </div>
+
+                              <div className="adminIncGeoMetaItem">
+                                <div className="adminIncGeoMetaLabel">¿Evaluable?</div>
+                                <div className="adminIncGeoMetaValue">
+                                  {formatBool(flags?.check_out_geo_can_evaluate_workplace)}
+                                </div>
+                              </div>
+
+                              <div className="adminIncGeoMetaItem">
+                                <div className="adminIncGeoMetaLabel">Motivo</div>
+                                <div className="adminIncGeoMetaValue">
+                                  {formatReason(flags?.check_out_geo_reason)}
+                                </div>
+                              </div>
+                            </div>
+
+                            <iframe
+                              className="adminIncMapFrame"
+                              src={buildGoogleMapsEmbedUrl(
+                                selectedEntryGeo.check_out_geo_lat,
+                                selectedEntryGeo.check_out_geo_lng
+                              )}
+                              loading="lazy"
+                              referrerPolicy="no-referrer-when-downgrade"
+                              title="Mapa de salida"
+                            />
+
+                            <a
+                              className="adminIncMapLink"
+                              href={buildGoogleMapsExternalUrl(
+                                selectedEntryGeo.check_out_geo_lat,
+                                selectedEntryGeo.check_out_geo_lng
+                              )}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              Ver ubicación exacta
+                            </a>
+                          </>
+                        ) : (
+                          <div className="adminIncActionText">
+                            No hay geolocalización registrada en la salida.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </main>
+
+              <aside
+                className="adminIncRightCol"
+                style={{ gap: 10, alignContent: "start" }}
+              >
+                <div className="adminIncPanel">
+                  <h4 className="adminIncPanelTitle">Motivo de resolución</h4>
+                  <textarea
+                    className="adminIncModalTextarea"
+                    value={resolutionReason}
+                    onChange={(e) => setResolutionReason(e.target.value)}
+                    placeholder="Escribe aquí el motivo obligatorio de validación o rechazo."
+                  />
+                </div>
+
+                <div className="adminIncPanel" style={{ display: "grid", gap: 10, minHeight: 0 }}>
+                  <h4 className="adminIncPanelTitle">Acciones rápidas</h4>
+
+                  <div className="adminIncActionText">
+                    {isTimeRequestIncident(selectedIncident)
+                      ? "Revisa el motivo de la incidencia por tramos y decide si la validas o la rechazas."
+                      : isAutomaticIncident(selectedIncident)
+                      ? "Revisa mapas, horas, flags y geolocalización antes de validar o rechazar la incidencia automática."
+                      : "Revisa la propuesta del trabajador, la ubicación y la coherencia del fichaje antes de validar o rechazar."}
+                  </div>
+
+                  <div style={{ display: "grid", gap: 8, marginTop: 2 }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                      <button
+                        className="adminIncBtn"
+                        disabled={resolving}
+                        onClick={closeIncidentModal}
+                        style={{ width: "100%" }}
+                      >
+                        Cerrar
+                      </button>
+
+                      <button
+                        className="adminIncBtn"
+                        disabled={resolving}
+                        onClick={() => navigate(`/admin/worker/${selectedIncident.user_id}`)}
+                        style={{ width: "100%" }}
+                      >
+                        Abrir ficha
+                      </button>
+                    </div>
+
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                      <button
+                        className="adminIncBtn primary"
+                        disabled={resolving}
+                        onClick={() => resolveIncident("validated")}
+                        style={{ width: "100%" }}
+                      >
+                        {resolving ? "Procesando…" : "Validar"}
+                      </button>
+
+                      <button
+                        className="adminIncBtn danger"
+                        disabled={resolving}
+                        onClick={() => resolveIncident("rejected")}
+                        style={{ width: "100%" }}
+                      >
+                        {resolving ? "Procesando…" : "Rechazar"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </aside>
             </div>
-          )}
-        </section>
-
-        <section className="workerCard workerBottomCard">
-          <IconButton
-            title="Ajustes"
-            onClick={() => setShowAdjust((s) => !s)}
-            disabled={isAdjustBlocked}
-          >
-            <SettingsIcon />
-          </IconButton>
-
-          <IconButton title="Histórico" onClick={() => navigate("/worker/history")}>
-            <HistoryIcon />
-          </IconButton>
-
-          <IconButton title="Gestiones" onClick={() => navigate("/worker/gestiones")}>
-            <BriefcaseIcon />
-          </IconButton>
-
-          <IconButton title="Salir" onClick={() => supabase.auth.signOut()}>
-            <LogoutIcon />
-          </IconButton>
-        </section>
-
-        {showAdjust && (
-          <section className="workerCard workerAdjustCard">
-            <div className="workerAdjustTitle">
-              {requiresNewProposal ? "Enviar nueva propuesta" : "Solicitar ajuste"}
-            </div>
-
-            <div className="workerAdjustHelp">{adjustmentHelpText}</div>
-
-            <input
-              className="workerAdjustInput"
-              value={adjustReason}
-              onChange={(e) => setAdjustReason(e.target.value)}
-              placeholder={
-                requiresNewProposal
-                  ? "Explica la nueva propuesta (obligatorio)"
-                  : openEntry
-                  ? "Ejemplo: olvidé fichar salida y solicito regularización"
-                  : "Ejemplo: olvidé fichar correctamente este tramo"
-              }
-            />
-
-            <button
-              className="workerAdjustBtn"
-              onClick={onSubmitAdjustment}
-              disabled={createAdjustment.isPending || adjustReason.trim().length < 3}
-            >
-              {createAdjustment.isPending
-                ? "Enviando…"
-                : requiresNewProposal
-                ? "Enviar nueva propuesta"
-                : "Enviar"}
-            </button>
-
-            {createAdjustment.error && (
-              <div className="workerErrorText">
-                {(createAdjustment.error as any)?.message ?? "Error"}
-              </div>
-            )}
-
-            {createAdjustment.isSuccess && (
-              <div className="workerSuccessText">
-                Tu solicitud de ajuste se ha enviado correctamente. El administrador la revisará.
-              </div>
-            )}
-          </section>
-        )}
-      </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
