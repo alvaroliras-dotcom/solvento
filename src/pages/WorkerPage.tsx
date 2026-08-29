@@ -38,6 +38,15 @@ function formatHHMM(iso: string) {
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
 
+// Formato que entiende un campo <input type="datetime-local">,
+// siempre en hora local del móvil.
+function toDateTimeLocalValue(d: Date) {
+  return (
+    `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}` +
+    `T${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+  );
+}
+
 function minutesBetween(startIso: string, endIso: string | null) {
   const start = new Date(startIso).getTime();
   const end = endIso ? new Date(endIso).getTime() : Date.now();
@@ -262,6 +271,12 @@ export function WorkerPage() {
 
   const [showAdjust, setShowAdjust] = useState(false);
   const [adjustReason, setAdjustReason] = useState("");
+
+  // Hora de salida que propone el trabajador. Antes no existía:
+  // se enviaba siempre el momento exacto de la solicitud, así que
+  // quien pedía el lunes por la mañana corregir el viernes por la
+  // tarde mandaba una propuesta con tres días de más.
+  const [adjustCheckOut, setAdjustCheckOut] = useState("");
   const [tick, setTick] = useState(0);
 
   // Error del último intento de fichar. Antes no existía: si el fichaje
@@ -489,14 +504,36 @@ export function WorkerPage() {
     const reason = adjustReason.trim();
     if (reason.length < 3) return;
 
+    const propuesta = adjustCheckOut
+      ? new Date(adjustCheckOut)
+      : new Date();
+
+    if (Number.isNaN(propuesta.getTime())) {
+      setActionError("La fecha y hora de salida no es válida.");
+      return;
+    }
+
+    if (propuesta.getTime() <= new Date(adjustmentTarget.check_in_at).getTime()) {
+      setActionError(
+        "La hora de salida tiene que ser posterior a la de entrada de esa jornada.",
+      );
+      return;
+    }
+
+    if (propuesta.getTime() > Date.now() + 60000) {
+      setActionError("No puedes proponer una hora de salida futura.");
+      return;
+    }
+
     try {
       await createAdjustment.mutateAsync({
         timeEntryId: adjustmentTarget.id,
-        proposedCheckOut: new Date().toISOString(),
+        proposedCheckOut: propuesta.toISOString(),
         reason,
       });
 
       setAdjustReason("");
+      setAdjustCheckOut("");
       setActionError(null);
       await loadHistory();
     } catch (err) {
@@ -1091,7 +1128,16 @@ export function WorkerPage() {
         <section className="workerCard workerBottomCard">
           <IconButton
             title="Ajustes"
-            onClick={() => setShowAdjust((s) => !s)}
+            onClick={() => {
+              setShowAdjust((s) => {
+                // Al abrirlo, se propone la hora actual como punto de
+                // partida, pero visible y editable por el trabajador.
+                if (!s && !adjustCheckOut) {
+                  setAdjustCheckOut(toDateTimeLocalValue(new Date()));
+                }
+                return !s;
+              });
+            }}
             disabled={isAdjustBlocked}
           >
             <SettingsIcon />
@@ -1118,6 +1164,26 @@ export function WorkerPage() {
 
             <div className="workerAdjustHelp">{adjustmentHelpText}</div>
 
+            {adjustmentTarget && (
+              <div className="workerAdjustHelp" style={{ fontWeight: 800 }}>
+                Entrada de esa jornada: {formatHHMM(adjustmentTarget.check_in_at)}
+              </div>
+            )}
+
+            <label
+              className="workerAdjustHelp"
+              style={{ display: "block", marginBottom: 4 }}
+            >
+              ¿A qué hora saliste de verdad?
+            </label>
+
+            <input
+              className="workerAdjustInput"
+              type="datetime-local"
+              value={adjustCheckOut}
+              onChange={(e) => setAdjustCheckOut(e.target.value)}
+            />
+
             <input
               className="workerAdjustInput"
               value={adjustReason}
@@ -1134,7 +1200,11 @@ export function WorkerPage() {
             <button
               className="workerAdjustBtn"
               onClick={onSubmitAdjustment}
-              disabled={createAdjustment.isPending || adjustReason.trim().length < 3}
+              disabled={
+                createAdjustment.isPending ||
+                adjustReason.trim().length < 3 ||
+                !adjustCheckOut
+              }
             >
               {createAdjustment.isPending
                 ? "Enviando…"
