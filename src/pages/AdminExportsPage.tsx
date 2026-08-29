@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
+import { fetchAllRows } from "../lib/fetchAllRows";
 import { useActiveMembership } from "../app/useActiveMembership";
 import { adminTheme } from "../ui/adminTheme";
 
@@ -473,13 +474,18 @@ export function AdminExportsPage() {
     const profilesById: Record<string, Profile> = {};
     for (const p of nextProfiles) profilesById[p.id] = p;
 
-    const { data, error } = await supabase
-      .from("time_entries")
-      .select("id,user_id,check_in_at,check_out_at,status,workflow_status,flags")
-      .eq("company_id", membership.company_id)
-      .gte("check_in_at", range.fromIso)
-      .lt("check_in_at", range.toIsoExclusive)
-      .order("check_in_at", { ascending: false });
+    // Se pide por bloques hasta agotar. Antes esto se cortaba a
+    // 1.000 filas sin avisar y la exportación salía incompleta.
+    const { data, error } = await fetchAllRows<TimeEntryRow>((desde, hasta) =>
+      supabase
+        .from("time_entries")
+        .select("id,user_id,check_in_at,check_out_at,status,workflow_status,flags")
+        .eq("company_id", membership.company_id)
+        .gte("check_in_at", range.fromIso)
+        .lt("check_in_at", range.toIsoExclusive)
+        .order("check_in_at", { ascending: false })
+        .range(desde, hasta),
+    );
 
     if (error) {
       setPreviewLoading(false);
