@@ -182,14 +182,18 @@ export async function createCheckIn(
 
   const todayEntries = await getTodayEntries(companyId, userId);
 
-  if (todayEntries.length >= MAX_DAILY_ENTRIES) {
-    throw new Error(
-      "Solo se permiten dos tramos de trabajo al día (mañana y tarde)."
-    );
-  }
+  // Antes esto impedía fichar a partir del tercer tramo. Quien salía
+  // al médico y volvía se quedaba sin poder registrar el resto del
+  // día, y como el error no se veía, se enteraba tarde o nunca.
+  //
+  // Ahora el fichaje SIEMPRE se registra. Un tercer tramo es raro,
+  // así que se marca como incidencia para que administración lo
+  // revise, pero la jornada del trabajador queda constando.
+  const tramoExtra = todayEntries.length >= MAX_DAILY_ENTRIES;
 
   const geoCheck = analyzeWorkplaceDistance(geo);
-  const shouldCreateAutomaticIncident = geoCheck.canEvaluate && geoCheck.isOutside;
+  const shouldCreateAutomaticIncident =
+    tramoExtra || (geoCheck.canEvaluate && geoCheck.isOutside);
 
   const payload = {
     p_company_id: companyId,
@@ -198,9 +202,14 @@ export async function createCheckIn(
     p_workflow_status: shouldCreateAutomaticIncident ? "pending" : "auto",
     p_flags: {
       auto_incident: shouldCreateAutomaticIncident,
-      auto_incident_reason: shouldCreateAutomaticIncident
+      auto_incident_reason: tramoExtra
+        ? "extra_daily_entry"
+        : shouldCreateAutomaticIncident
         ? "check_in_outside_workplace"
         : null,
+
+      extra_daily_entry: tramoExtra,
+      entries_today_before: todayEntries.length,
 
       workplace_reference_lat: WORKPLACE_LAT,
       workplace_reference_lng: WORKPLACE_LNG,
