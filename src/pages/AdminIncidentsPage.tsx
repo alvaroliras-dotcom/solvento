@@ -289,6 +289,11 @@ export function AdminIncidentsPage() {
   const { membership } = useActiveMembership();
 
   const [incidents, setIncidents] = useState<Incident[]>([]);
+
+  // Antes, si una de las consultas fallaba, la tabla se quedaba vacía y
+  // decía "No hay incidencias pendientes". Ahora se distingue "no hay
+  // nada" de "no se ha podido cargar".
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [profilesById, setProfilesById] = useState<Record<string, Profile>>({});
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState("");
@@ -379,6 +384,7 @@ const [rejectedToday, setRejectedToday] = useState(0);
     if (!membership) return;
 
     setLoading(true);
+    setLoadError(null);
 
     const { data: calendarData } = await supabase
       .from("company_work_calendar")
@@ -386,9 +392,17 @@ const [rejectedToday, setRejectedToday] = useState(0);
       .eq("company_id", membership.company_id)
       .maybeSingle<CalendarRow>();
 
-    const { data: manualData } = await supabase.rpc("admin_pending_adjustments", {
-      p_company_id: membership.company_id,
-    });
+    const { data: manualData, error: manualError } = await supabase.rpc(
+      "admin_pending_adjustments",
+      { p_company_id: membership.company_id },
+    );
+
+    if (manualError) {
+      setLoadError(manualError.message);
+      setIncidents([]);
+      setLoading(false);
+      return;
+    }
 
     const manual: Incident[] =
       ((manualData ?? []) as Omit<Incident, "source_type">[]).map((item) => ({
@@ -396,11 +410,18 @@ const [rejectedToday, setRejectedToday] = useState(0);
         source_type: "manual",
       }));
 
-    const { data: autoRows } = await supabase
+    const { data: autoRows, error: autoError } = await supabase
       .from("time_entries")
       .select("id,user_id,check_in_at,check_out_at,flags")
       .eq("company_id", membership.company_id)
       .eq("workflow_status", "pending");
+
+    if (autoError) {
+      setLoadError(autoError.message);
+      setIncidents([]);
+      setLoading(false);
+      return;
+    }
 
     const automatic: Incident[] =
       (autoRows ?? []).map((e: any) => ({
@@ -416,12 +437,19 @@ const [rejectedToday, setRejectedToday] = useState(0);
         source_type: "automatic",
       })) ?? [];
 
-    const { data: requestRows } = await supabase
+    const { data: requestRows, error: requestError } = await supabase
       .from("time_entry_requests")
       .select("id,time_entry_id,requested_by,requested_at,reason,status")
       .eq("company_id", membership.company_id)
       .eq("status", "pending")
       .returns<TimeRequestRow[]>();
+
+    if (requestError) {
+      setLoadError(requestError.message);
+      setIncidents([]);
+      setLoading(false);
+      return;
+    }
 
     const requestTimeEntryIds = Array.from(
       new Set(
@@ -497,6 +525,37 @@ const [rejectedToday, setRejectedToday] = useState(0);
 
     if (reason.length < 3) {
       alert("El motivo de resolución es obligatorio (mínimo 3 caracteres).");
+      return;
+    }
+
+    // La salida tiene que ser posterior a la entrada. Sin esta
+    // comprobación se guardaban jornadas de duración cero o negativa,
+    // que después desaparecían de los totales de horas sin avisar.
+    if (decision === "validated" && !isTimeRequestIncident(selectedIncident)) {
+      const entrada = fromDateTimeLocalValue(finalCheckIn);
+      const salida = fromDateTimeLocalValue(finalCheckOut);
+
+      if (entrada && salida && new Date(salida) <= new Date(entrada)) {
+        alert(
+          "La hora de salida tiene que ser posterior a la de entrada.\n\n" +
+            "Si la jornada terminó al día siguiente, cambia también la fecha.",
+        );
+        return;
+      }
+    }
+
+    // Sin los datos del fichaje cargados, guardar borraría la ubicación,
+    // la distancia al centro y el motivo original de la incidencia.
+    if (
+      isAutomaticIncident(selectedIncident) &&
+      selectedIncident.time_entry_id &&
+      !selectedEntryGeo
+    ) {
+      alert(
+        "No se han podido cargar los datos del fichaje.\n\n" +
+          "Cierra la incidencia, recarga la página y vuelve a abrirla. " +
+          "Si se guarda ahora, se perderían la ubicación y el motivo original.",
+      );
       return;
     }
 
@@ -1291,7 +1350,29 @@ const [rejectedToday, setRejectedToday] = useState(0);
                 </tr>
               ))}
 
-              {!loading && filteredIncidents.length === 0 && (
+              {!loading && loadError && (
+                <tr>
+                  <td
+                    colSpan={6}
+                    className="adminIncEmpty"
+                    style={{
+                      color: adminTheme.colors.danger,
+                      background: adminTheme.colors.dangerSoft,
+                      fontWeight: 700,
+                    }}
+                  >
+                    No se han podido cargar las incidencias. Puede haber
+                    incidencias pendientes que no se están mostrando. Recarga la
+                    página y, si sigue igual, avisa antes de dar el día por
+                    revisado.
+                    <div style={{ fontWeight: 500, marginTop: 6, fontSize: 12 }}>
+                      Detalle técnico: {loadError}
+                    </div>
+                  </td>
+                </tr>
+              )}
+
+              {!loading && !loadError && filteredIncidents.length === 0 && (
                 <tr>
                   <td colSpan={6} className="adminIncEmpty">
                     No hay incidencias pendientes.
