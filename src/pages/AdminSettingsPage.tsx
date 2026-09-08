@@ -285,7 +285,18 @@ export function AdminSettingsPage() {
     if (!membership?.company_id) return;
 
     const name = holidayName.trim();
-    if (!holidayDate || !name) return;
+
+    // Antes se salia en silencio: el boton estaba activo, se pulsaba y
+    // no pasaba nada ni se decia por que.
+    if (!holidayDate) {
+      setError("Elige la fecha del festivo.");
+      return;
+    }
+
+    if (!name) {
+      setError("Escribe el nombre del festivo.");
+      return;
+    }
 
     setSavingHoliday(true);
     setError(null);
@@ -313,13 +324,22 @@ export function AdminSettingsPage() {
     setSuccess("Festivo añadido correctamente.");
   }
 
+  // Estos borrados eran definitivos y sin preguntar: bastaba un clic mal
+  // dado para perder un festivo, una baja medica o una solicitud de
+  // vacaciones sin forma de recuperarla. Se acota ademas por empresa.
   async function removeHoliday(id: string) {
+    if (!membership?.company_id) return;
+    if (!window.confirm("¿Seguro que quieres eliminar este festivo? No se puede deshacer.")) {
+      return;
+    }
+
     setError(null);
     setSuccess(null);
 
     const { error: deleteError } = await supabase
       .from("company_holidays")
       .delete()
+      .eq("company_id", membership.company_id)
       .eq("id", id);
 
     if (deleteError) {
@@ -381,12 +401,22 @@ export function AdminSettingsPage() {
   }
 
   async function removeAbsence(id: string) {
+    if (!membership?.company_id) return;
+    if (
+      !window.confirm(
+        "¿Seguro que quieres eliminar esta ausencia? No se puede deshacer y puede ser un justificante.",
+      )
+    ) {
+      return;
+    }
+
     setError(null);
     setSuccess(null);
 
     const { error: deleteError } = await supabase
       .from("worker_absences")
       .delete()
+      .eq("company_id", membership.company_id)
       .eq("id", id);
 
     if (deleteError) {
@@ -435,6 +465,15 @@ export function AdminSettingsPage() {
 
 
 async function deleteWorkerRequest(id: string) {
+  if (!membership?.company_id) return;
+  if (
+    !window.confirm(
+      "¿Seguro que quieres eliminar esta solicitud? No se puede deshacer.",
+    )
+  ) {
+    return;
+  }
+
   setMarkingRequestId(id);
   setError(null);
   setSuccess(null);
@@ -442,6 +481,7 @@ async function deleteWorkerRequest(id: string) {
   const { error: deleteError } = await supabase
     .from("worker_requests")
     .delete()
+    .eq("company_id", membership.company_id)
     .eq("id", id);
 
   if (deleteError) {
