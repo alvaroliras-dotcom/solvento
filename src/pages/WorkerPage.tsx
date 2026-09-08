@@ -19,7 +19,7 @@ type HistoryEntry = {
   id: string;
   check_in_at: string;
   check_out_at: string | null;
-  workflow_status: "auto" | "pending" | "adjusted" | "requires_new_proposal";
+  workflow_status: "auto" | "pending" | "adjusted" | "rejected";
 };
 
 type GeoPayload = {
@@ -353,7 +353,7 @@ export function WorkerPage() {
   }, [openEntry, lastTodayEntry]);
 
     const requiresNewProposal =
-    adjustmentTarget?.workflow_status === "requires_new_proposal";
+    adjustmentTarget?.workflow_status === "rejected";
 
    const isMainBlocked = false;
   const isAdjustBlocked = false;
@@ -525,6 +525,20 @@ export function WorkerPage() {
       return;
     }
 
+    // El campo venia relleno con la hora actual, asi que quien corregia
+    // el lunes una jornada del viernes enviaba sin darse cuenta una
+    // propuesta de sesenta horas, y el sistema la aceptaba.
+    const horasPropuestas =
+      (propuesta.getTime() - new Date(adjustmentTarget.check_in_at).getTime()) /
+      3600000;
+
+    if (horasPropuestas > 14) {
+      setActionError(
+        "Esa salida son mas de 14 horas desde la entrada. Revisa la fecha antes de enviarla.",
+      );
+      return;
+    }
+
     try {
       await createAdjustment.mutateAsync({
         timeEntryId: adjustmentTarget.id,
@@ -548,21 +562,46 @@ export function WorkerPage() {
   // PARTE 5/6 — EFECTOS Y ESTADOS BASE
   // ======================================================
 
+  // Sin el catch, un fallo de red dejaba la pantalla en "Cargando
+  // usuario..." para siempre y el trabajador no podia fichar.
   useEffect(() => {
-  supabase.auth.getUser().then(({ data }) => {
-    setUserId(data.user?.id ?? null);
-  });
+    let cancelado = false;
 
-  navigator.geolocation.getCurrentPosition(
-    () => {},
-    () => {},
-    {
-      enableHighAccuracy: true,
-      timeout: 5000,
-      maximumAge: 0,
+    supabase.auth
+      .getUser()
+      .then(({ data, error: authError }) => {
+        if (cancelado) return;
+        if (authError) {
+          setActionError("No se ha podido comprobar tu sesion. Reintenta.");
+          return;
+        }
+        setUserId(data.user?.id ?? null);
+      })
+      .catch(() => {
+        if (!cancelado) {
+          setActionError("No hay conexion. Comprueba la cobertura y reintenta.");
+        }
+      });
+
+    // Se pide permiso de ubicacion por adelantado, pero solo si el
+    // navegador la soporta: sin esta comprobacion la pantalla podia
+    // quedarse en blanco.
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        () => {},
+        () => {},
+        {
+          enableHighAccuracy: true,
+          timeout: 5000,
+          maximumAge: 0,
+        }
+      );
     }
-  );
-}, []);
+
+    return () => {
+      cancelado = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!activeCompany || !userId) return;
@@ -1130,10 +1169,21 @@ export function WorkerPage() {
             title="Ajustes"
             onClick={() => {
               setShowAdjust((s) => {
-                // Al abrirlo, se propone la hora actual como punto de
-                // partida, pero visible y editable por el trabajador.
+                // Se propone la hora de fin de jornada del dia que se esta
+                // corrigiendo, no la hora actual: si no, al corregir el
+                // lunes una jornada del viernes salia una propuesta
+                // absurda de sesenta horas.
                 if (!s && !adjustCheckOut) {
-                  setAdjustCheckOut(toDateTimeLocalValue(new Date()));
+                  const base = adjustmentTarget
+                    ? new Date(adjustmentTarget.check_in_at)
+                    : new Date();
+                  if (adjustmentTarget) base.setHours(18, 0, 0, 0);
+                  setAdjustCheckOut(toDateTimeLocalValue(base));
+                }
+                if (s) {
+                  // Al cerrar se limpia el aviso de "enviado
+                  // correctamente": si no, seguia ahi dias despues.
+                  createAdjustment.reset();
                 }
                 return !s;
               });
