@@ -25,6 +25,7 @@ export function AdminEmployeesPage() {
   const [employees, setEmployees] = useState<Profile[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
+  const [loadError, setLoadError] = useState<string | null>(null);
 
 // ======================================================
 // PARTE 3/6 — CARGA DE DATOS
@@ -35,22 +36,28 @@ export function AdminEmployeesPage() {
 
     setLoading(true);
 
+    setLoadError(null);
+
     const { data, error } = await supabase.rpc("admin_company_profiles", {
       p_company_id: membership.company_id,
     });
 
-    if (!error && data) {
-      const sorted = [...(data as Profile[])].sort((a, b) => {
-        const ak = (a.full_name ?? a.email ?? a.id).toLowerCase();
-        const bk = (b.full_name ?? b.email ?? b.id).toLowerCase();
-        return ak.localeCompare(bk);
-      });
-
-      setEmployees(sorted);
-    } else {
+    // Antes un fallo de red se mostraba como "No hay empleados en esta
+    // empresa", que hace pensar que se han borrado los datos.
+    if (error) {
+      setLoadError(error.message);
       setEmployees([]);
+      setLoading(false);
+      return;
     }
 
+    const sorted = [...((data ?? []) as Profile[])].sort((a, b) => {
+      const ak = (a.full_name ?? a.email ?? a.id).toLowerCase();
+      const bk = (b.full_name ?? b.email ?? b.id).toLowerCase();
+      return ak.localeCompare(bk);
+    });
+
+    setEmployees(sorted);
     setLoading(false);
   }
 
@@ -260,7 +267,11 @@ export function AdminEmployeesPage() {
         {loading && <div className="adminEmpEmpty">Cargando empleados…</div>}
 
         {!loading && employees.length === 0 && (
-          <div className="adminEmpEmpty">No hay empleados en esta empresa.</div>
+          <div className="adminEmpEmpty">
+            {loadError
+              ? "No se ha podido cargar el listado: " + loadError
+              : "No hay empleados en esta empresa."}
+          </div>
         )}
 
         {!loading && employees.length > 0 && (
