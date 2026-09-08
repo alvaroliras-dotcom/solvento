@@ -489,11 +489,18 @@ export function AdminPage() {
       source_type: "manual",
     }));
 
-    const { data: autoRows, error: autoError } = await supabase
-      .from("time_entries")
-      .select("id,user_id,check_in_at,check_out_at,flags")
-      .eq("company_id", membership.company_id)
-      .eq("workflow_status", "pending");
+    // Se pide por bloques: sin paginar, esta consulta se cortaba a las
+    // 1.000 primeras filas en silencio en cuanto se acumularan.
+    const { data: autoRows, error: autoError } = await fetchAllRows<any>(
+      (desde, hasta) =>
+        supabase
+          .from("time_entries")
+          .select("id,user_id,check_in_at,check_out_at,flags")
+          .eq("company_id", membership.company_id)
+          .eq("workflow_status", "pending")
+          .order("check_in_at", { ascending: false })
+          .range(desde, hasta),
+    );
 
     if (autoError) {
       setError(autoError.message);
