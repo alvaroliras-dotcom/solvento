@@ -12,7 +12,7 @@ type HistoryEntry = {
     | "auto"
     | "pending"
     | "adjusted"
-    | "requires_new_proposal"
+    | "rejected"
     | null;
   flags?: any;
 };
@@ -35,11 +35,42 @@ function formatHour(iso: string) {
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
 
-function minutesBetween(startIso: string, endIso: string | null) {
+function esDeHoy(iso: string) {
+  const d = new Date(iso);
+  const hoy = new Date();
+  return (
+    d.getFullYear() === hoy.getFullYear() &&
+    d.getMonth() === hoy.getMonth() &&
+    d.getDate() === hoy.getDate()
+  );
+}
+
+// Un tramo sin hora de salida solo sigue contando si es de hoy.
+// Antes seguia sumando minutos indefinidamente: una jornada que se
+// quedo sin cerrar en julio aparecia semanas despues con cientos de
+// horas, tanto aqui como en el CSV que se descarga el trabajador.
+// Ahora esos tramos no suman y se marcan como pendientes.
+function minutesBetween(startIso: string, endIso: string | null): number | null {
+  if (!endIso) {
+    if (!esDeHoy(startIso)) return null;
+    const abierto = Date.now() - new Date(startIso).getTime();
+    return Math.floor(Math.max(0, abierto) / 60000);
+  }
+
   const start = new Date(startIso).getTime();
-  const end = endIso ? new Date(endIso).getTime() : Date.now();
-  const diffMs = Math.max(0, end - start);
-  return Math.floor(diffMs / 60000);
+  const end = new Date(endIso).getTime();
+  return Math.floor(Math.max(0, end - start) / 60000);
+}
+
+// El historial se pedia por numero de registros (los ultimos 60), y el
+// corte caia a mitad de un dia: ese dia aparecia con un solo tramo y
+// con un total de horas falso. Ahora se pide por fecha, asi que ningun
+// dia se parte por la mitad.
+function inicioDeHace12Meses() {
+  const d = new Date();
+  d.setMonth(d.getMonth() - 12);
+  d.setHours(0, 0, 0, 0);
+  return d.toISOString();
 }
 
 function hhmmFromMinutes(totalMinutes: number) {
@@ -95,13 +126,32 @@ export function WorkerHistoryPage() {
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [errorUsuario, setErrorUsuario] = useState<string | null>(null);
 
   const [openDays, setOpenDays] = useState<Record<string, boolean>>({});
 
+  // Si esta lectura fallaba, la pantalla se quedaba en "Cargando
+  // usuario..." para siempre, sin error y sin salida.
   useEffect(() => {
-    supabase.auth.getUser().then(({ data }) => {
-      setUserId(data.user?.id ?? null);
-    });
+    let cancelado = false;
+
+    supabase.auth
+      .getUser()
+      .then(({ data, error: authError }) => {
+        if (cancelado) return;
+        if (authError) {
+          setErrorUsuario("No se ha podido comprobar tu sesion.");
+          return;
+        }
+        setUserId(data.user?.id ?? null);
+      })
+      .catch(() => {
+        if (!cancelado) setErrorUsuario("No hay conexion. Intentalo de nuevo.");
+      });
+
+    return () => {
+      cancelado = true;
+    };
   }, []);
 
   async function loadHistory() {
@@ -115,8 +165,9 @@ export function WorkerHistoryPage() {
       .select("id,check_in_at,check_out_at,workflow_status,flags")
       .eq("company_id", membership.company_id)
       .eq("user_id", userId)
+      .gte("check_in_at", inicioDeHace12Meses())
       .order("check_in_at", { ascending: false })
-      .limit(60);
+      .limit(2000);
 
     if (error) {
       setError(error.message);
@@ -147,18 +198,25 @@ export function WorkerHistoryPage() {
 
     return Array.from(map.entries()).map(([key, items]) => {
       const totalMinutes = items.reduce(
-        (acc, item) => acc + minutesBetween(item.check_in_at, item.check_out_at),
+        (acc, item) => acc + (minutesBetween(item.check_in_at, item.check_out_at) ?? 0),
         0
       );
 
+      // "adjusted" significa que administracion ya lo corrigio: esta
+      // resuelto y no debe pintarse como incidencia abierta.
       const hasIncident = items.some(
         (item) =>
           item.workflow_status === "pending" ||
-          item.workflow_status === "adjusted" ||
-          item.workflow_status === "requires_new_proposal"
+          item.workflow_status === "rejected"
       );
 
       const hasOpen = items.some((item) => !item.check_out_at);
+
+      // Un dia con un tramo sin cerrar que no es de hoy tiene el total
+      // incompleto, y hay que decirlo en vez de dar una cifra a medias.
+      const totalIncompleto = items.some(
+        (item) => !item.check_out_at && !esDeHoy(item.check_in_at)
+      );
 
       return {
         key,
@@ -168,6 +226,7 @@ export function WorkerHistoryPage() {
         count: items.length,
         hasIncident,
         hasOpen,
+        totalIncompleto,
       };
     });
   }, [history]);
@@ -189,7 +248,16 @@ export function WorkerHistoryPage() {
           background: adminTheme.colors.pageBg,
         }}
       >
-        Cargando usuario...
+        {errorUsuario ? (
+          <div style={{ display: "grid", gap: 12, justifyItems: "start" }}>
+            <div style={{ fontWeight: 900 }}>{errorUsuario}</div>
+            <button type="button" onClick={() => window.location.reload()}>
+              Reintentar
+            </button>
+          </div>
+        ) : (
+          "Cargando usuario..."
+        )}
       </div>
     );
   }
@@ -420,6 +488,7 @@ export function WorkerHistoryPage() {
                         }}
                       >
                         {hhmmFromMinutes(group.totalMinutes)}
+                        {group.totalIncompleto ? " (incompleto)" : ""}
                       </div>
                     </div>
 
@@ -481,8 +550,18 @@ export function WorkerHistoryPage() {
                       const mins = minutesBetween(item.check_in_at, item.check_out_at);
                       const hasIncident =
                         item.workflow_status === "pending" ||
-                        item.workflow_status === "adjusted" ||
-                        item.workflow_status === "requires_new_proposal";
+                        item.workflow_status === "rejected";
+                      const estadoTramo = !item.check_out_at
+                        ? esDeHoy(item.check_in_at)
+                          ? "abierto"
+                          : "sin cerrar"
+                        : item.workflow_status === "pending"
+                        ? "pendiente"
+                        : item.workflow_status === "rejected"
+                        ? "rechazada"
+                        : item.workflow_status === "adjusted"
+                        ? "corregida"
+                        : "normal";
 
                       return (
                         <div
@@ -535,11 +614,7 @@ export function WorkerHistoryPage() {
                                 }`,
                               }}
                             >
-                              {!item.check_out_at
-                                ? "abierto"
-                                : hasIncident
-                                ? item.workflow_status
-                                : "normal"}
+                              {estadoTramo}
                             </div>
                           </div>
 
@@ -633,7 +708,7 @@ export function WorkerHistoryPage() {
                                   fontWeight: 950,
                                 }}
                               >
-                                {hhmmFromMinutes(mins)}
+                                {mins === null ? "pendiente" : hhmmFromMinutes(mins)}
                               </div>
                             </div>
                           </div>
