@@ -8,7 +8,7 @@ export type TimeEntry = {
 
   status: string | null;
 
-  workflow_status: "auto" | "pending" | "adjusted" | "requires_new_proposal";
+  workflow_status: "auto" | "pending" | "adjusted" | "rejected";
   flags: Record<string, any> | null;
 
   check_in_geo_lat?: number | null;
