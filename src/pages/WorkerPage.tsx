@@ -303,7 +303,12 @@ export function WorkerPage() {
   const checkOut = useCheckOut();
   const createAdjustment = useCreateAdjustment();
 
-  const today = useMemo(() => new Date(), []);
+  // La fecha se calculaba una sola vez al abrir la pantalla. Si la app
+  // se quedaba abierta y pasaba la medianoche, la cabecera seguia
+  // mostrando el dia anterior y el fichaje de madrugada no aparecia en
+  // el bloque de "hoy": ponia "sin registros" y el total en cero.
+  // Ahora se recalcula con el mismo temporizador del reloj.
+  const today = useMemo(() => new Date(), [tick]);
   const isOpen = !!openEntry;
 
   // ======================================================
