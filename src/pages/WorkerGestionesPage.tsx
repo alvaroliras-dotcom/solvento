@@ -32,9 +32,27 @@ function formatHourEs(iso: string) {
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
 
-function minutesBetween(startIso: string, endIso: string | null) {
+function esDeHoy(iso: string) {
+  const d = new Date(iso);
+  const hoy = new Date();
+  return (
+    d.getFullYear() === hoy.getFullYear() &&
+    d.getMonth() === hoy.getMonth() &&
+    d.getDate() === hoy.getDate()
+  );
+}
+
+// Un tramo sin salida solo sigue contando si es de hoy. Antes seguia
+// sumando minutos indefinidamente y en el CSV aparecian jornadas de
+// cientos de horas presentadas como el dato bueno.
+function minutesBetween(startIso: string, endIso: string | null): number | null {
+  if (!endIso) {
+    if (!esDeHoy(startIso)) return null;
+    return Math.max(0, Math.floor((Date.now() - new Date(startIso).getTime()) / 60000));
+  }
+
   const start = new Date(startIso).getTime();
-  const end = endIso ? new Date(endIso).getTime() : Date.now();
+  const end = new Date(endIso).getTime();
   return Math.max(0, Math.floor((end - start) / 60000));
 }
 
@@ -328,10 +346,24 @@ export function WorkerGestionesPage() {
   const [requestLoading, setRequestLoading] = useState(false);
   const [requestMessage, setRequestMessage] = useState<string | null>(null);
 
+  // Sin el catch, la pantalla se quedaba cargando para siempre.
   useEffect(() => {
-    supabase.auth.getUser().then(({ data }) => {
-      setUserId(data.user?.id ?? null);
-    });
+    let cancelado = false;
+
+    supabase.auth
+      .getUser()
+      .then(({ data }) => {
+        if (!cancelado) setUserId(data.user?.id ?? null);
+      })
+      .catch(() => {
+        if (!cancelado) {
+          setDownloadMessage("No se ha podido comprobar tu sesión. Reintenta.");
+        }
+      });
+
+    return () => {
+      cancelado = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -399,7 +431,8 @@ export function WorkerGestionesPage() {
         .eq("user_id", userId)
         .gte("check_in_at", rangeStart.toISOString())
         .lte("check_in_at", rangeEnd.toISOString())
-        .order("check_in_at", { ascending: true });
+        .order("check_in_at", { ascending: true })
+        .limit(5000);
 
       if (error) {
         setDownloadMessage(error.message);
@@ -416,7 +449,12 @@ export function WorkerGestionesPage() {
             csvEscape(formatDateEs(row.check_in_at)),
             csvEscape(formatHourEs(row.check_in_at)),
             csvEscape(row.check_out_at ? formatHourEs(row.check_out_at) : ""),
-            csvEscape(hhmmFromMinutes(minutesBetween(row.check_in_at, row.check_out_at))),
+            csvEscape(
+              (() => {
+                const m = minutesBetween(row.check_in_at, row.check_out_at);
+                return m === null ? "pendiente de regularizar" : hhmmFromMinutes(m);
+              })(),
+            ),
             csvEscape(row.workflow_status ?? ""),
           ].join(",")
         ),
