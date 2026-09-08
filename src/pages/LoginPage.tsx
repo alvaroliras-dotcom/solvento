@@ -54,7 +54,22 @@ export function LoginPage() {
 
     if (error) {
       setLoading(false);
-      setError("Correo o PIN incorrectos.");
+
+      // Antes cualquier fallo, incluido quedarse sin cobertura, se
+      // traducia como "PIN incorrecto": el trabajador se ponia a probar
+      // claves y acababa llamando a administracion.
+      const texto = (error.message ?? "").toLowerCase();
+      const esDeRed =
+        texto.includes("fetch") ||
+        texto.includes("network") ||
+        texto.includes("timeout") ||
+        (typeof error.status === "number" && error.status >= 500);
+
+      setError(
+        esDeRed
+          ? "No hay conexión. Comprueba la cobertura e inténtalo de nuevo."
+          : "Correo o PIN incorrectos.",
+      );
       return;
     }
 
