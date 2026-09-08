@@ -58,6 +58,7 @@ type Profile = {
   id: string;
   email: string | null;
   full_name: string | null;
+  status?: string | null;
 };
 
 type Preset = "today" | "week" | "month" | "custom";
@@ -416,13 +417,21 @@ export function AdminPage() {
   // PARTE 4/6 — CARGA DE DATOS Y ACCIONES
   // ======================================================
 
+  // Se piden TODOS los perfiles, tambien los de baja. Antes solo se
+  // pedian los activos, asi que en informes y exportaciones las horas de
+  // quien ya no esta salian con un codigo en vez de su nombre, y el
+  // fichero parecia correcto. El listado de empleados si sigue mostrando
+  // solo a los activos.
   async function loadProfilesForCompany(companyId: string) {
-    const { data, error } = await supabase.rpc("admin_company_profiles", {
+    const { data, error } = await supabase.rpc("admin_company_profiles_all", {
       p_company_id: companyId,
     });
 
     if (error) {
-      console.error("admin_company_profiles error:", error);
+      setError(
+        "No se han podido cargar los nombres de los trabajadores: " +
+          error.message,
+      );
       return;
     }
 
@@ -431,11 +440,13 @@ export function AdminPage() {
 
     for (const p of list) map[p.id] = p;
 
-    const sorted = [...list].sort((a, b) => {
-      const ak = (a.full_name ?? a.email ?? a.id).toLowerCase();
-      const bk = (b.full_name ?? b.email ?? b.id).toLowerCase();
-      return ak.localeCompare(bk);
-    });
+    const sorted = list
+      .filter((p) => (p.status ?? "active") === "active")
+      .sort((a, b) => {
+        const ak = (a.full_name ?? a.email ?? a.id).toLowerCase();
+        const bk = (b.full_name ?? b.email ?? b.id).toLowerCase();
+        return ak.localeCompare(bk);
+      });
 
     setProfilesById(map);
     setEmployees(sorted);
@@ -512,17 +523,52 @@ export function AdminPage() {
         source_type: "automatic",
       })) ?? [];
 
-    const nextItems = [...manual, ...auto].sort(
+    // La bandeja de incidencias se alimenta de tres sitios y este panel
+    // solo miraba dos: el contador de la portada decia 86 cuando en la
+    // pantalla de incidencias habia 334.
+    const { data: solicitudRows, error: solicitudError } = await supabase
+      .from("time_entry_requests")
+      .select("id,time_entry_id,requested_by,requested_at,reason,status")
+      .eq("company_id", membership.company_id)
+      .eq("status", "pending");
+
+    if (solicitudError) {
+      setError(solicitudError.message);
+      setItems([]);
+      setLoading(false);
+      return;
+    }
+
+    const solicitudes: PendingAdjustment[] = ((solicitudRows ?? []) as any[]).map(
+      (r) => ({
+        adjustment_id: `req-${r.id}`,
+        time_entry_id: r.time_entry_id ?? "",
+        user_id: r.requested_by,
+        check_in_at: r.requested_at,
+        proposed_check_out: r.requested_at,
+        reason: r.reason ?? "Incidencia pendiente",
+        created_at: r.requested_at,
+        source_type: "automatic",
+      }),
+    );
+
+    const nextItems = [...manual, ...auto, ...solicitudes].sort(
       (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
     );
 
     setItems(nextItems);
 
+    // "Trabajando ahora" contaba TODAS las jornadas sin cerrar desde que
+    // existe la aplicacion, asi que cada olvido de fichar la salida subia
+    // ese numero para siempre. Ahora solo cuenta las de hoy.
+    const inicioDeHoy = startOfLocalDay(new Date()).toISOString();
+
     const { count, error: openErr } = await supabase
       .from("time_entries")
       .select("id", { count: "exact", head: true })
       .eq("company_id", membership.company_id)
-      .is("check_out_at", null);
+      .is("check_out_at", null)
+      .gte("check_in_at", inicioDeHoy);
 
     if (openErr) {
       setError(openErr.message);
@@ -723,6 +769,8 @@ export function AdminPage() {
         user_id: r.user_id,
         full_name: p?.full_name ?? "",
         email: p?.email ?? "",
+        entrada_local: formatLocalDateTime(r.check_in_at),
+        salida_local: r.check_out_at ? formatLocalDateTime(r.check_out_at) : "",
         check_in_at_utc: r.check_in_at,
         check_out_at_utc: r.check_out_at ?? "",
         duracion_minutos: minutes,
