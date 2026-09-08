@@ -1,4 +1,5 @@
 import { adminTheme } from "../ui/adminTheme";
+import { supabase } from "../lib/supabaseClient";
 
 // ======================================================
 // PARTE 1/3 — COMPONENTE
@@ -57,8 +58,47 @@ export function PendingPage() {
             fontWeight: 600,
           }}
         >
-          Tu usuario no está asignado a ninguna empresa.
+          Tu usuario no está asignado a ninguna empresa. Si crees que es un
+          error, avisa a administración.
         </p>
+
+        {/* Esta pantalla era un callejón sin salida: sin ningún botón, quien
+            llegaba aquí por error no podía ni reintentar ni salir. */}
+        <button
+          type="button"
+          onClick={() => window.location.reload()}
+          style={{
+            border: `1px solid ${adminTheme.colors.border}`,
+            background: adminTheme.colors.panelBg,
+            color: adminTheme.colors.text,
+            borderRadius: 12,
+            padding: "12px 16px",
+            fontWeight: 900,
+            fontSize: 15,
+            cursor: "pointer",
+          }}
+        >
+          Reintentar
+        </button>
+
+        <button
+          type="button"
+          onClick={async () => {
+            await supabase.auth.signOut();
+            window.location.replace("/login");
+          }}
+          style={{
+            border: "none",
+            background: "transparent",
+            color: adminTheme.colors.textSoft,
+            fontWeight: 800,
+            fontSize: 14,
+            cursor: "pointer",
+            padding: 4,
+          }}
+        >
+          Cerrar sesión
+        </button>
       </div>
     </div>
   );
