@@ -346,9 +346,9 @@ const [rejectedToday, setRejectedToday] = useState(0);
 
     const { data: requestRows } = await supabase
       .from("time_entry_requests")
-      .select("status,resolved_at")
+      .select("status,resolved_at,time_entry_id")
       .eq("company_id", membership.company_id)
-      .in("status", ["validated", "rejected"]);
+      .in("status", ["approved", "rejected"]);
 
     let validated = 0;
     let rejected = 0;
@@ -369,12 +369,23 @@ const [rejectedToday, setRejectedToday] = useState(0);
       if (row.workflow_status === "rejected") rejected += 1;
     }
 
-    for (const row of (requestRows ?? []) as Array<{ status: string; resolved_at: string | null }>) {
+    for (const row of (requestRows ?? []) as Array<{
+      status: string;
+      resolved_at: string | null;
+      time_entry_id: string | null;
+    }>) {
       if (!isIsoWithinRange(row.resolved_at, fromIso, toIsoExclusive)) {
         continue;
       }
 
-      if (row.status === "validated") validated += 1;
+      // Solo las que no tienen jornada enlazada. Las demas ya se cuentan
+      // arriba por el estado de la propia jornada y saldrian dos veces.
+      if (row.time_entry_id) continue;
+
+      // El estado que guarda la base de datos es "approved". Se estaba
+      // buscando "validated", que no existe, asi que este contador nunca
+      // sumaba las incidencias resueltas.
+      if (row.status === "approved") validated += 1;
       if (row.status === "rejected") rejected += 1;
     }
 
@@ -505,7 +516,9 @@ const [rejectedToday, setRejectedToday] = useState(0);
 
     setIncidents(combined);
 
-    const { data: profilesData } = await supabase.rpc("admin_company_profiles", {
+    // Con la version que solo devuelve activos, las incidencias de quien
+    // ya causo baja aparecian en la bandeja como un codigo largo.
+    const { data: profilesData } = await supabase.rpc("admin_company_profiles_all", {
       p_company_id: membership.company_id,
     });
 
