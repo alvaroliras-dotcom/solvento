@@ -8,7 +8,11 @@ export function RequireAuth({ children }: { children: React.ReactNode }) {
   const location = useLocation();
   const [loading, setLoading] = useState(true);
 
-  const { membership, loading: membershipLoading } = useActiveMembership();
+  const {
+    membership,
+    loading: membershipLoading,
+    error: membershipError,
+  } = useActiveMembership();
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
@@ -32,6 +36,35 @@ export function RequireAuth({ children }: { children: React.ReactNode }) {
   }, [navigate]);
 
   if (loading || membershipLoading) return <div>Cargando...</div>;
+
+  // Un fallo al comprobar el acceso no es lo mismo que no tener empresa.
+  // Mandar aqui al trabajador a "acceso pendiente" le dejaba sin poder
+  // fichar y sin ninguna salida.
+  if (membershipError) {
+    return (
+      <div style={{ padding: 24, display: "grid", gap: 12, justifyItems: "start" }}>
+        <div style={{ fontSize: 18, fontWeight: 900 }}>
+          No se ha podido comprobar tu acceso
+        </div>
+        <div style={{ fontSize: 15, lineHeight: 1.5 }}>
+          Suele ser un problema de conexion. Vuelve a intentarlo; si sigue sin
+          entrar, avisa a administracion.
+        </div>
+        <button type="button" onClick={() => window.location.reload()}>
+          Reintentar
+        </button>
+        <button
+          type="button"
+          onClick={async () => {
+            await supabase.auth.signOut();
+            navigate("/login", { replace: true });
+          }}
+        >
+          Cerrar sesion
+        </button>
+      </div>
+    );
+  }
 
   if (!membership) {
     navigate("/pending", { replace: true });
