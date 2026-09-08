@@ -425,13 +425,15 @@ export function AdminWorkerPage() {
     setLoading(true);
     setError(null);
 
+    // Incluye a los trabajadores de baja: su ficha y su historico se
+    // conservan cuatro anos y tienen que poder consultarse con nombre.
     const { data: companyProfiles, error: profErr } = await supabase.rpc(
-      "admin_company_profiles",
+      "admin_company_profiles_all",
       { p_company_id: membership.company_id }
     );
 
     if (profErr) {
-      console.error("admin_company_profiles error:", profErr);
+      setError("No se ha podido cargar la ficha: " + profErr.message);
       setProfile(null);
     } else {
       const list = (companyProfiles ?? []) as Profile[];
