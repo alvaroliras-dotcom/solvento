@@ -79,6 +79,34 @@ function toDateInputValue(d: Date) {
   return `${year}-${month}-${day}`;
 }
 
+// ======================================================
+// CONVERSIÓN DE HORAS PARA LOS CAMPOS DE EDICIÓN
+// ======================================================
+// Los campos <input type="datetime-local"> trabajan en hora local
+// del navegador. La base de datos guarda en UTC. Estas dos
+// funciones hacen la conversión en los dos sentidos.
+
+function toDateTimeLocalValue(value: string | null | undefined) {
+  if (!value) return "";
+
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return "";
+
+  return (
+    `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}` +
+    `T${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+  );
+}
+
+function fromDateTimeLocalValue(value: string) {
+  if (!value) return null;
+
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+
+  return d.toISOString();
+}
+
 function fromDateInputValue(s: string) {
   const [y, m, d] = s.split("-").map(Number);
   return new Date(y, (m ?? 1) - 1, d ?? 1, 0, 0, 0, 0);
@@ -233,6 +261,22 @@ export function AdminWorkerPage() {
   const [selectedGeoEntry, setSelectedGeoEntry] = useState<TimeEntryRow | null>(null);
 
   // ======================================================
+  // EDICIÓN Y ALTA MANUAL DE JORNADAS
+  // ======================================================
+  // Hasta ahora, la única forma de tocar un fichaje era que
+  // existiera una incidencia. Si el trabajador no fichaba nada, o
+  // fichaba tarde sin que saltara incidencia, no había manera de
+  // dejar constancia de que había trabajado.
+
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [editingEntry, setEditingEntry] = useState<TimeEntryRow | null>(null);
+  const [editCheckIn, setEditCheckIn] = useState("");
+  const [editCheckOut, setEditCheckOut] = useState("");
+  const [editReason, setEditReason] = useState("");
+  const [savingEntry, setSavingEntry] = useState(false);
+  const [editorError, setEditorError] = useState<string | null>(null);
+
+  // ======================================================
   // PARTE 3/6 — RANGO Y HELPERS DE PÁGINA
   // ======================================================
 
@@ -293,6 +337,87 @@ export function AdminWorkerPage() {
   // ======================================================
   // PARTE 4/6 — CARGA DE DATOS Y ACCIONES
   // ======================================================
+
+  function openEditor(entry: TimeEntryRow | null) {
+    setEditingEntry(entry);
+    setEditorError(null);
+    setEditReason("");
+
+    if (entry) {
+      setEditCheckIn(toDateTimeLocalValue(entry.check_in_at));
+      setEditCheckOut(toDateTimeLocalValue(entry.check_out_at));
+    } else {
+      // Alta manual: se propone el horario general de la empresa
+      // sobre el último día del rango que se está mirando.
+      const base = fromDateInputValue(toDateStr);
+      const entrada = new Date(base);
+      entrada.setHours(8, 30, 0, 0);
+      const salida = new Date(base);
+      salida.setHours(14, 0, 0, 0);
+
+      setEditCheckIn(toDateTimeLocalValue(entrada.toISOString()));
+      setEditCheckOut(toDateTimeLocalValue(salida.toISOString()));
+    }
+
+    setEditorOpen(true);
+  }
+
+  function closeEditor() {
+    setEditorOpen(false);
+    setEditingEntry(null);
+    setEditCheckIn("");
+    setEditCheckOut("");
+    setEditReason("");
+    setEditorError(null);
+  }
+
+  async function saveEntry() {
+    if (!membership || !userId) return;
+
+    const motivo = editReason.trim();
+
+    if (motivo.length < 3) {
+      setEditorError("Escribe el motivo del cambio (mínimo 3 caracteres).");
+      return;
+    }
+
+    const entrada = fromDateTimeLocalValue(editCheckIn);
+    const salida = fromDateTimeLocalValue(editCheckOut);
+
+    if (!entrada) {
+      setEditorError("Falta la fecha y hora de entrada.");
+      return;
+    }
+
+    if (salida && new Date(salida) <= new Date(entrada)) {
+      setEditorError(
+        "La salida tiene que ser posterior a la entrada. Si la jornada acabó al día siguiente, cambia también la fecha.",
+      );
+      return;
+    }
+
+    setSavingEntry(true);
+    setEditorError(null);
+
+    const { error: saveErr } = await supabase.rpc("admin_save_time_entry", {
+      p_company_id: membership.company_id,
+      p_user_id: userId,
+      p_check_in: entrada,
+      p_check_out: salida,
+      p_reason: motivo,
+      p_time_entry_id: editingEntry?.id ?? null,
+    });
+
+    setSavingEntry(false);
+
+    if (saveErr) {
+      setEditorError(saveErr.message);
+      return;
+    }
+
+    closeEditor();
+    await load();
+  }
 
   async function load() {
     if (!membership || !userId) return;
@@ -1065,13 +1190,37 @@ export function AdminWorkerPage() {
       </section>
 
       <section className="adminWorkerCard">
-        <h2 className="adminWorkerCardTitle">Jornadas del trabajador</h2>
-        <p className="adminWorkerCardSub">Registros de entrada y salida en el rango seleccionado</p>
+        <div
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            gap: 12,
+            alignItems: "flex-start",
+            justifyContent: "space-between",
+          }}
+        >
+          <div>
+            <h2 className="adminWorkerCardTitle">Jornadas del trabajador</h2>
+            <p className="adminWorkerCardSub">
+              Registros de entrada y salida en el rango seleccionado
+            </p>
+          </div>
+
+          <button
+            className="adminWorkerBtn primary"
+            onClick={() => openEditor(null)}
+          >
+            Añadir jornada
+          </button>
+        </div>
 
         {loading && <div className="adminWorkerEmpty">Cargando jornadas…</div>}
 
         {!loading && entries.length === 0 && (
-          <div className="adminWorkerEmpty">No hay jornadas en este rango.</div>
+          <div className="adminWorkerEmpty">
+            No hay jornadas en este rango. Si el trabajador vino y no fichó,
+            usa «Añadir jornada» para dejarlo registrado.
+          </div>
         )}
 
         {!loading && entries.length > 0 && (
@@ -1134,16 +1283,30 @@ export function AdminWorkerPage() {
                       </td>
 
                       <td>
-                        {e.workflow_status === "pending" ? (
+                        <div
+                          style={{
+                            display: "flex",
+                            gap: 6,
+                            justifyContent: "flex-end",
+                            flexWrap: "wrap",
+                          }}
+                        >
                           <button
-                            className="adminWorkerBtn primary small"
-                            onClick={openIncidentsPage}
+                            className="adminWorkerBtn small"
+                            onClick={() => openEditor(e)}
                           >
-                            Revisar
+                            Editar
                           </button>
-                        ) : (
-                          "—"
-                        )}
+
+                          {e.workflow_status === "pending" && (
+                            <button
+                              className="adminWorkerBtn primary small"
+                              onClick={openIncidentsPage}
+                            >
+                              Revisar
+                            </button>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   );
@@ -1153,6 +1316,152 @@ export function AdminWorkerPage() {
           </div>
         )}
       </section>
+
+      {editorOpen && (
+        <div className="adminWorkerGeoModalOverlay" onClick={closeEditor}>
+          <div
+            className="adminWorkerGeoModalCard"
+            onClick={(ev) => ev.stopPropagation()}
+            style={{ maxWidth: 520 }}
+          >
+            <div className="adminWorkerGeoHeader">
+              <div>
+                <h3 className="adminWorkerGeoTitle">
+                  {editingEntry ? "Corregir jornada" : "Añadir jornada"}
+                </h3>
+                <div className="adminWorkerGeoSub">
+                  {(profile?.full_name ?? "").trim() ||
+                    profile?.email ||
+                    "Trabajador"}
+                </div>
+              </div>
+
+              <button className="adminWorkerBtn" onClick={closeEditor}>
+                Cerrar
+              </button>
+            </div>
+
+            <div style={{ display: "grid", gap: 14, marginTop: 16 }}>
+              <div>
+                <label
+                  style={{
+                    display: "block",
+                    fontSize: 12,
+                    fontWeight: 800,
+                    letterSpacing: 0.4,
+                    textTransform: "uppercase",
+                    color: adminTheme.colors.textSoft,
+                    marginBottom: 6,
+                  }}
+                >
+                  Entrada
+                </label>
+                <input
+                  className="adminWorkerInput"
+                  type="datetime-local"
+                  value={editCheckIn}
+                  onChange={(ev) => setEditCheckIn(ev.target.value)}
+                  style={{ width: "100%" }}
+                />
+              </div>
+
+              <div>
+                <label
+                  style={{
+                    display: "block",
+                    fontSize: 12,
+                    fontWeight: 800,
+                    letterSpacing: 0.4,
+                    textTransform: "uppercase",
+                    color: adminTheme.colors.textSoft,
+                    marginBottom: 6,
+                  }}
+                >
+                  Salida
+                </label>
+                <input
+                  className="adminWorkerInput"
+                  type="datetime-local"
+                  value={editCheckOut}
+                  onChange={(ev) => setEditCheckOut(ev.target.value)}
+                  style={{ width: "100%" }}
+                />
+                <div
+                  style={{
+                    fontSize: 12,
+                    color: adminTheme.colors.textMuted,
+                    marginTop: 4,
+                  }}
+                >
+                  Déjalo vacío si la jornada sigue abierta.
+                </div>
+              </div>
+
+              <div>
+                <label
+                  style={{
+                    display: "block",
+                    fontSize: 12,
+                    fontWeight: 800,
+                    letterSpacing: 0.4,
+                    textTransform: "uppercase",
+                    color: adminTheme.colors.textSoft,
+                    marginBottom: 6,
+                  }}
+                >
+                  Motivo
+                </label>
+                <input
+                  className="adminWorkerInput"
+                  value={editReason}
+                  onChange={(ev) => setEditReason(ev.target.value)}
+                  placeholder="Ej.: se quedó sin batería y no pudo fichar"
+                  style={{ width: "100%" }}
+                />
+              </div>
+
+              {editorError && (
+                <div
+                  style={{
+                    background: adminTheme.colors.dangerSoft,
+                    color: adminTheme.colors.danger,
+                    border: `1px solid ${adminTheme.colors.danger}`,
+                    borderRadius: 10,
+                    padding: "10px 12px",
+                    fontSize: 14,
+                    fontWeight: 700,
+                  }}
+                >
+                  {editorError}
+                </div>
+              )}
+
+              <div
+                style={{
+                  fontSize: 12.5,
+                  color: adminTheme.colors.textMuted,
+                  lineHeight: 1.45,
+                }}
+              >
+                Queda registrado quién ha hecho el cambio, cuándo y qué valores
+                había antes. Los avisos pendientes de ese día se cierran solos.
+              </div>
+
+              <button
+                className="adminWorkerBtn primary"
+                onClick={saveEntry}
+                disabled={savingEntry || editReason.trim().length < 3}
+              >
+                {savingEntry
+                  ? "Guardando…"
+                  : editingEntry
+                  ? "Guardar corrección"
+                  : "Registrar jornada"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {selectedGeoEntry && (
         <div
