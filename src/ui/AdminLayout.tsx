@@ -419,7 +419,7 @@ export function AdminLayout() {
 				src={adminTheme.logos.secondary}
 				alt="Cerbero"
 			  />
-			  <div className="cerbAdmVersion">DEMO</div>
+			  <div className="cerbAdmVersion">v1.1</div>
 		  </div>
         </aside>
 
