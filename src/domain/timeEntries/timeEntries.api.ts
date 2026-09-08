@@ -230,8 +230,6 @@ export async function createCheckIn(
     p_check_in_geo_captured_at: geo?.capturedAt ?? null,
   };
 
-  console.log("CHECK IN RPC PAYLOAD", payload);
-
   const { data, error } = await supabase.rpc(
     "create_checkin_server_time",
     payload
@@ -325,8 +323,6 @@ export async function createCheckOut(
     p_check_out_geo_accuracy_m: geo?.accuracy ?? null,
     p_check_out_geo_captured_at: geo?.capturedAt ?? null,
   };
-
-  console.log("CHECK OUT RPC PAYLOAD", { entryId, payload });
 
   const { data, error } = await supabase.rpc(
     "create_checkout_server_time",
