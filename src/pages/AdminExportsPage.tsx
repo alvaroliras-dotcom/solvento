@@ -458,8 +458,11 @@ export function AdminExportsPage() {
     setPreviewLoading(true);
     setError(null);
 
+    // Tambien los trabajadores de baja: sus horas siguen teniendo que
+    // salir con nombre en cualquier exportacion para la gestoria o para
+    // una inspeccion.
     const { data: profilesData, error: profilesError } = await supabase.rpc(
-      "admin_company_profiles",
+      "admin_company_profiles_all",
       { p_company_id: membership.company_id }
     );
 
