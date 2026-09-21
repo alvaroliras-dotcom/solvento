@@ -607,8 +607,6 @@ const [rejectedToday, setRejectedToday] = useState(0);
         incident_closed_from_backoffice: true,
       };
 
-      const { data: authData } = await supabase.auth.getUser();
-      const adminUserId = authData.user?.id ?? null;
 
       const updatePayload: Record<string, any> = {
         workflow_status: decision === "validated" ? "adjusted" : "rejected",
@@ -639,21 +637,23 @@ const [rejectedToday, setRejectedToday] = useState(0);
         return;
       }
 
-      await supabase.from("time_entry_logs").insert({
-        company_id: membership?.company_id,
-        time_entry_id: selectedIncident.time_entry_id,
-        action:
+      // El registro de auditoria ya no se escribe directamente desde el
+      // navegador: lo hace la funcion log_time_entry_action, que comprueba
+      // que quien la llama es administrador de esa empresa y firma la linea
+      // con su propio identificador. Asi la tabla no se puede falsear.
+      const { error: logError } = await supabase.rpc("log_time_entry_action", {
+        p_company_id: membership?.company_id,
+        p_time_entry_id: selectedIncident.time_entry_id,
+        p_action:
           decision === "validated"
             ? "automatic_incident_validated"
             : "automatic_incident_rejected",
-        performed_by: adminUserId,
-        performed_role: "admin",
-        old_values: {
+        p_old_values: {
           check_in_at: selectedIncident.check_in_at,
           check_out_at: previousCheckOutAt,
           workflow_status: "pending",
         },
-        new_values: {
+        p_new_values: {
           check_in_at:
             fromDateTimeLocalValue(finalCheckIn) ?? selectedIncident.check_in_at,
           check_out_at:
@@ -662,6 +662,14 @@ const [rejectedToday, setRejectedToday] = useState(0);
           resolution_reason: reason,
         },
       });
+
+      if (logError) {
+        alert(
+          "La incidencia se ha resuelto, pero no ha quedado registrada en el " +
+            "historial de cambios: " +
+            logError.message,
+        );
+      }
 
       setResolving(false);
       closeIncidentModal();
@@ -685,8 +693,6 @@ const [rejectedToday, setRejectedToday] = useState(0);
     const nextCheckIn =
       decision === "validated" ? fromDateTimeLocalValue(finalCheckIn) : null;
 
-    const { data: authData } = await supabase.auth.getUser();
-    const adminUserId = authData.user?.id ?? null;
 
     const { error } = await supabase.rpc("resolve_time_entry_adjustment", {
       p_adjustment_id: selectedIncident.adjustment_id,
@@ -719,20 +725,29 @@ const [rejectedToday, setRejectedToday] = useState(0);
         return;
       }
 
-      await supabase.from("time_entry_logs").insert({
-        company_id: membership?.company_id,
-        time_entry_id: selectedIncident.time_entry_id,
-        action: "check_in_corrected",
-        performed_by: adminUserId,
-        performed_role: "admin",
-        old_values: {
-          check_in_at: selectedIncident.check_in_at,
+      const { error: checkInLogError } = await supabase.rpc(
+        "log_time_entry_action",
+        {
+          p_company_id: membership?.company_id,
+          p_time_entry_id: selectedIncident.time_entry_id,
+          p_action: "check_in_corrected",
+          p_old_values: {
+            check_in_at: selectedIncident.check_in_at,
+          },
+          p_new_values: {
+            check_in_at: nextCheckIn,
+            resolution_reason: reason,
+          },
         },
-        new_values: {
-          check_in_at: nextCheckIn,
-          resolution_reason: reason,
-        },
-      });
+      );
+
+      if (checkInLogError) {
+        alert(
+          "La entrada se ha corregido, pero el cambio no ha quedado " +
+            "registrado en el historial: " +
+            checkInLogError.message,
+        );
+      }
     }
 
     setResolving(false);
