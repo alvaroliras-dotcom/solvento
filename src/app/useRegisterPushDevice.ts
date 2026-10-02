@@ -1,49 +1,87 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
-import { requestPushPermissionAndToken } from "../lib/pushMessaging";
+import {
+  isIos,
+  listenForegroundMessages,
+  pushPermissionState,
+  requestPushPermissionAndToken,
+} from "../lib/pushMessaging";
 import { savePushDevice } from "../lib/pushDevices";
 import { useActiveMembership } from "./useActiveMembership";
 
+// Registra este dispositivo para recibir avisos push.
+//
+// - Si el permiso ya esta concedido, se registra sin preguntar.
+// - En Android y escritorio se pide el permiso al entrar, como antes.
+// - En iPhone el permiso solo se puede pedir desde un boton: el hook
+//   devuelve needsPermission=true y la pantalla muestra "Activar avisos".
 export function useRegisterPushDevice(enabled: boolean = true) {
   const { membership, loading: membershipLoading } = useActiveMembership();
   const startedRef = useRef(false);
+  const [needsPermission, setNeedsPermission] = useState(false);
+
+  const companyId = membership?.company_id ?? null;
+
+  const register = useCallback(async () => {
+    if (!companyId) return;
+
+    const { data: authData, error: authError } = await supabase.auth.getUser();
+    if (authError) throw authError;
+    if (!authData.user) return;
+
+    const token = await requestPushPermissionAndToken();
+
+    await savePushDevice({
+      companyId,
+      userId: authData.user.id,
+      deviceToken: token,
+    });
+  }, [companyId]);
 
   useEffect(() => {
     if (!enabled) return;
     if (startedRef.current) return;
     if (membershipLoading) return;
-    if (!membership?.company_id) return;
+    if (!companyId) return;
 
-    const companyId = membership.company_id;
-
-    let cancelled = false;
     startedRef.current = true;
 
-    async function run() {
-      try {
-        const { data: authData, error: authError } = await supabase.auth.getUser();
+    const permission = pushPermissionState();
+    if (permission === "unsupported" || permission === "denied") return;
 
-        if (authError) throw authError;
-        if (!authData.user) return;
-
-        const token = await requestPushPermissionAndToken();
-
-        if (cancelled) return;
-
-        await savePushDevice({
-          companyId,
-          userId: authData.user.id,
-          deviceToken: token,
-        });
-      } catch (error) {
-        console.warn("[push] no se pudo registrar el dispositivo", error);
-      }
+    if (permission === "default" && isIos()) {
+      setNeedsPermission(true);
+      return;
     }
 
-    run();
+    register().catch((error) => {
+      console.warn("[push] no se pudo registrar el dispositivo", error);
+    });
+  }, [enabled, membershipLoading, companyId, register]);
 
-    return () => {
-      cancelled = true;
-    };
-  }, [enabled, membershipLoading, membership?.company_id]);
+  useEffect(() => {
+    if (!enabled) return;
+    let unsubscribe: (() => void) | undefined;
+    listenForegroundMessages()
+      .then((fn) => {
+        unsubscribe = fn;
+      })
+      .catch(() => undefined);
+    return () => unsubscribe?.();
+  }, [enabled]);
+
+  // Para llamar desde el boton "Activar avisos".
+  const enable = useCallback(async () => {
+    try {
+      await register();
+      setNeedsPermission(false);
+      return true;
+    } catch (error) {
+      console.warn("[push] no se pudo activar", error);
+      setNeedsPermission(pushPermissionState() === "default");
+      return false;
+    }
+  }, [register]);
+
+  return { needsPermission, enable };
 }

@@ -8,6 +8,8 @@ import {
 } from "../domain/timeEntries/timeEntries.hooks";
 import { useActiveMembership } from "../app/useActiveMembership";
 import { useRegisterPushDevice } from "../app/useRegisterPushDevice";
+import { deactivateCurrentPushDevice } from "../lib/pushDevices";
+import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { adminTheme } from "../ui/adminTheme";
 
@@ -96,13 +98,21 @@ function getCurrentPosition(): Promise<GeoPayload | null> {
         });
       },
       () => resolve(null),
+      // 5 s se quedaba corto en iPhone y en interiores: el fichaje salia
+      // sin ubicacion. Se aceptan posiciones de hasta 30 s de antiguedad.
       {
         enableHighAccuracy: true,
-        timeout: 5000,
-        maximumAge: 0,
+        timeout: 10000,
+        maximumAge: 30000,
       }
     );
   });
+}
+
+function formatShortDateEs(iso: string) {
+  const d = new Date(iso);
+  const weekday = d.toLocaleDateString("es-ES", { weekday: "long" });
+  return `${weekday} ${d.getDate()} a las ${formatHHMM(iso)}`;
 }
 
 function BracketArrowIcon({ direction }: { direction: "in" | "out" }) {
@@ -263,7 +273,8 @@ export function WorkerPage() {
   const [userId, setUserId] = useState<string | null>(null);
   const { membership, loading: membershipLoading } = useActiveMembership();
 
-  useRegisterPushDevice(!!membership?.company_id);
+  const queryClient = useQueryClient();
+  const push = useRegisterPushDevice(!!membership?.company_id);
 
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -310,6 +321,12 @@ export function WorkerPage() {
   // Ahora se recalcula con el mismo temporizador del reloj.
   const today = useMemo(() => new Date(), [tick]);
   const isOpen = !!openEntry;
+
+  // Jornada que se quedo abierta un dia anterior. Antes el boton SALIR la
+  // cerraba con la hora de ahora (tramos de 20 horas) y el trabajador creia
+  // haber fichado la entrada de hoy. Ahora se le pide la hora real de salida.
+  const staleOpenEntry =
+    openEntry && !isSameLocalDay(openEntry.check_in_at, today) ? openEntry : null;
 
   // ======================================================
   // PARTE 3/6 — DATOS DERIVADOS
@@ -414,7 +431,7 @@ export function WorkerPage() {
   const isBusy =
     pressing || (isOpen && checkOut.isPending) || (!isOpen && checkIn.isPending);
 
-  const mainLabel = isOpen ? "SALIR" : "ENTRAR";
+  const mainLabel = staleOpenEntry ? "CERRAR AYER" : isOpen ? "SALIR" : "ENTRAR";
   const todayShown = todayEntries.slice(0, 2);
 
   // ======================================================
@@ -444,6 +461,38 @@ export function WorkerPage() {
 
     setHistory((data ?? []) as HistoryEntry[]);
     setHistoryLoading(false);
+  }
+
+  // Hora de salida que se propone al abrir el ajuste: la de fin de jornada
+  // del dia que se corrige (18:00), o entrada + 8 h si la entrada fue por la
+  // tarde, y nunca en el futuro. Antes se proponia la hora actual y quien
+  // corregia el lunes una jornada del viernes enviaba sesenta horas.
+  function defaultProposal(checkInIso?: string) {
+    if (!checkInIso) return toDateTimeLocalValue(new Date());
+    const entrada = new Date(checkInIso);
+    const base = new Date(entrada);
+    base.setHours(18, 0, 0, 0);
+    if (base.getTime() <= entrada.getTime()) {
+      base.setTime(entrada.getTime() + 8 * 3600000);
+    }
+    if (base.getTime() > Date.now()) base.setTime(Date.now());
+    return toDateTimeLocalValue(base);
+  }
+
+  function openAdjustPanel(checkInIso?: string) {
+    setAdjustCheckOut(defaultProposal(checkInIso));
+    createAdjustment.reset();
+    setShowAdjust(true);
+  }
+
+  // Cerrar sesion: se desactiva el aviso push de este movil (si no, seguia
+  // recibiendo los avisos del trabajador que salio) y se limpia la cache
+  // para que otra persona en el mismo movil no vea datos del anterior.
+  async function logout() {
+    await deactivateCurrentPushDevice().catch(() => undefined);
+    queryClient.clear();
+    await supabase.auth.signOut().catch(() => undefined);
+    navigate("/login", { replace: true });
   }
 
   function describeError(err: unknown) {
@@ -488,6 +537,12 @@ export function WorkerPage() {
 
       if (!freshOpenEntry) {
         await checkIn.mutateAsync(geo);
+      } else if (!isSameLocalDay(freshOpenEntry.check_in_at, new Date())) {
+        openAdjustPanel(freshOpenEntry.check_in_at);
+        setActionError(
+          `Tienes sin cerrar la jornada del ${formatShortDateEs(freshOpenEntry.check_in_at)}. ` +
+            "Indica abajo a qué hora saliste y pulsa Enviar: se cerrará y podrás fichar la entrada de hoy.",
+        );
       } else {
         await checkOut.mutateAsync({ entryId: freshOpenEntry.id, geo });
       }
@@ -551,6 +606,17 @@ export function WorkerPage() {
         reason,
       });
 
+      // Si era una jornada de un dia anterior que seguia abierta, se cierra
+      // ya (queda pendiente de revision con la hora propuesta) para que el
+      // trabajador pueda fichar la entrada de hoy.
+      if (
+        !adjustmentTarget.check_out_at &&
+        !isSameLocalDay(adjustmentTarget.check_in_at, new Date())
+      ) {
+        await checkOut.mutateAsync({ entryId: adjustmentTarget.id, geo: null });
+        await refetchOpenEntry();
+      }
+
       setAdjustReason("");
       setAdjustCheckOut("");
       setActionError(null);
@@ -580,7 +646,11 @@ export function WorkerPage() {
           setActionError("No se ha podido comprobar tu sesion. Reintenta.");
           return;
         }
-        setUserId(data.user?.id ?? null);
+        if (!data.user) {
+          setActionError("Tu sesión ha caducado. Vuelve a entrar con tu PIN.");
+          return;
+        }
+        setUserId(data.user.id);
       })
       .catch(() => {
         if (!cancelado) {
@@ -614,11 +684,30 @@ export function WorkerPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeCompany, userId]);
 
+  // El reloj corre siempre (cada segundo con jornada abierta, cada 30 s si
+  // no) para que la fecha cambie al pasar la medianoche aunque no haya
+  // jornada abierta.
   useEffect(() => {
-    if (!openEntry) return;
-    const t = window.setInterval(() => setTick((x) => x + 1), 1000);
+    const t = window.setInterval(
+      () => setTick((x) => x + 1),
+      openEntry ? 1000 : 30000,
+    );
     return () => window.clearInterval(t);
   }, [openEntry]);
+
+  // Al volver a la app (estaba en segundo plano) se recarga el estado real:
+  // si no, por la mañana seguia mostrando los datos de ayer.
+  useEffect(() => {
+    function onVisible() {
+      if (document.visibilityState !== "visible") return;
+      setTick((x) => x + 1);
+      refetchOpenEntry();
+      loadHistory();
+    }
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeCompany, userId]);
 
   useEffect(() => {
     if (requiresNewProposal) {
@@ -636,7 +725,19 @@ export function WorkerPage() {
           background: adminTheme.colors.pageBg,
         }}
       >
-        Cargando usuario...
+        {actionError ? (
+          <>
+            <p>{actionError}</p>
+            <button type="button" onClick={() => window.location.reload()}>
+              Reintentar
+            </button>{" "}
+            <button type="button" onClick={() => logout()}>
+              Volver a entrar
+            </button>
+          </>
+        ) : (
+          "Cargando usuario..."
+        )}
       </div>
     );
   }
@@ -1085,6 +1186,20 @@ export function WorkerPage() {
             </button>
           </div>
 
+          {push.needsPermission && (
+            <div className="workerMessage">
+              Activa los avisos para que te recordemos fichar.
+              <button
+                type="button"
+                className="workerAdjustBtn"
+                style={{ display: "block", margin: "10px auto 0" }}
+                onClick={() => push.enable()}
+              >
+                Activar avisos
+              </button>
+            </div>
+          )}
+
           {actionError && (
             <div className="workerMessage error" role="alert">
               {actionError}
@@ -1174,16 +1289,8 @@ export function WorkerPage() {
             title="Ajustes"
             onClick={() => {
               setShowAdjust((s) => {
-                // Se propone la hora de fin de jornada del dia que se esta
-                // corrigiendo, no la hora actual: si no, al corregir el
-                // lunes una jornada del viernes salia una propuesta
-                // absurda de sesenta horas.
                 if (!s && !adjustCheckOut) {
-                  const base = adjustmentTarget
-                    ? new Date(adjustmentTarget.check_in_at)
-                    : new Date();
-                  if (adjustmentTarget) base.setHours(18, 0, 0, 0);
-                  setAdjustCheckOut(toDateTimeLocalValue(base));
+                  setAdjustCheckOut(defaultProposal(adjustmentTarget?.check_in_at));
                 }
                 if (s) {
                   // Al cerrar se limpia el aviso de "enviado
@@ -1206,7 +1313,7 @@ export function WorkerPage() {
             <BriefcaseIcon />
           </IconButton>
 
-          <IconButton title="Salir" onClick={() => supabase.auth.signOut()}>
+          <IconButton title="Salir" onClick={() => logout()}>
             <LogoutIcon />
           </IconButton>
         </section>

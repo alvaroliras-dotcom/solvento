@@ -23,8 +23,8 @@ messaging.onBackgroundMessage((payload) => {
   const notificationOptions = {
   body:
     payload?.data?.body || "Tienes una notificación pendiente.",
-  icon: "/pwa-192x192.png",
-  badge: "/pwa-192x192.png",
+  icon: "/cerbero-icon-512.png",
+  badge: "/cerbero-icon-512.png",
   requireInteraction: true,
   silent: false,
   data: {

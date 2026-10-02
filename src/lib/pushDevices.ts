@@ -80,3 +80,10 @@ export async function touchPushDevice(deviceToken: string) {
 
   if (error) throw error;
 }
+// Al cerrar sesion se da de baja este movil: si no, seguia recibiendo los
+// avisos del trabajador que salio.
+export async function deactivateCurrentPushDevice() {
+  const { getCurrentPushToken } = await import("./pushMessaging");
+  const token = await getCurrentPushToken();
+  if (token) await deactivatePushDevice(token);
+}
