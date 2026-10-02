@@ -66,7 +66,10 @@ export function PendingPage() {
             llegaba aquí por error no podía ni reintentar ni salir. */}
         <button
           type="button"
-          onClick={() => window.location.reload()}
+          // Antes recargaba esta misma pantalla y nunca volvia a comprobar
+          // el acceso: a quien daban de alta despues se quedaba aqui. La
+          // pantalla de entrada comprueba la sesion y le lleva a su sitio.
+          onClick={() => window.location.replace("/login")}
           style={{
             border: `1px solid ${adminTheme.colors.border}`,
             background: adminTheme.colors.panelBg,

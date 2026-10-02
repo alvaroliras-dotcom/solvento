@@ -44,3 +44,31 @@ Si alguien vuelve a publicar la tarea automatica desde este repositorio, que
 compruebe antes que la copia de aqui esta al dia. En agosto de 2026 la copia
 que habia era antigua y apuntaba a una empresa que ya no existe: publicarla
 habria dejado sin incidencias a toda la plantilla.
+
+## Cambios posteriores (2 de octubre de 2026)
+
+`funciones.sql` y `permisos.sql` son la foto del 8 de septiembre. Los cambios
+de despues estan, en orden, en `supabase/migrations/` (ya aplicados en
+produccion). Antes de tocarlos se hizo una copia completa de tablas,
+funciones y politicas en el esquema `backup_20261002` de la propia base de
+datos.
+
+Resumen de lo que cambio:
+
+- Nada se puede llamar sin sesion. Las funciones que solo usa la tarea
+  automatica no se pueden llamar ni con sesion.
+- Fichar: lo decide todo el servidor (hora, geovalla de `company_geofence`,
+  incidencias). El trabajador ya no puede escribir directamente en
+  `time_entries`. Solo puede haber una jornada abierta por trabajador.
+- Los dados de baja (`memberships.status <> 'active'`) pierden el acceso.
+- Las incidencias se resuelven en una sola operacion en el servidor
+  (`resolve_automatic_incident`, `resolve_time_entry_adjustment`,
+  `resolve_time_entry_request`), con su registro de auditoria.
+- La tarea automatica (`run_long_open_shift_checks`) exige la contraseña
+  `cerbero_cron_secret` del almacen de secretos (Vault); el cron la manda en
+  la cabecera `x-cron-secret`. Los avisos push (`send_push_notification`)
+  solo los acepta si los pide el propio servidor.
+- La tarea ya no duplica las incidencias de "falta fichaje" tras resolverlas.
+
+Si se vuelve a desplegar una Edge Function desde aqui, el codigo de
+`supabase/functions/` es el que esta en produccion a 2 de octubre de 2026.

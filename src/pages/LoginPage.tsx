@@ -2,12 +2,15 @@ import { useState, useEffect, useRef } from "react";
 import { supabase } from "../lib/supabaseClient";
 import { useNavigate } from "react-router-dom";
 import { adminTheme } from "../ui/adminTheme";
+import { useQueryClient } from "@tanstack/react-query";
+import { fetchMyMembership, MEMBERSHIP_QUERY_KEY } from "../app/useActiveMembership";
 
 // Clave con la que se guarda el correo recordado en este dispositivo.
 const REMEMBER_KEY = "cerbero_saved_email";
 
 export function LoginPage() {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
 
   const [email, setEmail] = useState("");
   const [pin, setPin] = useState("");
@@ -16,6 +19,41 @@ export function LoginPage() {
   const [loading, setLoading] = useState(false);
 
   const pinRef = useRef<HTMLInputElement>(null);
+
+  // La app instalada abre siempre en "/", que es esta pantalla. Antes pedia
+  // el PIN cada vez aunque la sesion siguiera activa. Ahora, si hay sesion,
+  // lleva directamente a fichar o al panel.
+  const [checkingSession, setCheckingSession] = useState(true);
+
+  useEffect(() => {
+    let cancelado = false;
+
+    (async () => {
+      try {
+        const { data } = await supabase.auth.getSession();
+        if (!data.session) return;
+        const membership = await queryClient.fetchQuery({
+          queryKey: MEMBERSHIP_QUERY_KEY,
+          queryFn: fetchMyMembership,
+        });
+        if (cancelado) return;
+        if (!membership) {
+          navigate("/pending", { replace: true });
+          return;
+        }
+        const esAdmin = membership.role === "owner" || membership.role === "admin";
+        navigate(esAdmin ? "/admin" : "/worker", { replace: true });
+      } catch {
+        // sin conexion: se muestra el formulario normal
+      } finally {
+        if (!cancelado) setCheckingSession(false);
+      }
+    })();
+
+    return () => {
+      cancelado = true;
+    };
+  }, [navigate, queryClient]);
 
   // Al cargar la pantalla, recuperamos el usuario guardado en este dispositivo (si lo hay).
   useEffect(() => {
@@ -81,22 +119,32 @@ export function LoginPage() {
       localStorage.removeItem(REMEMBER_KEY);
     }
 
-    const { data: memberships, error: membershipsError } = await supabase.rpc("my_memberships");
-
-    setLoading(false);
-
-    if (membershipsError) {
-      setError("No se pudo cargar tu acceso.");
+    let membership;
+    try {
+      queryClient.removeQueries({ queryKey: MEMBERSHIP_QUERY_KEY });
+      membership = await queryClient.fetchQuery({
+        queryKey: MEMBERSHIP_QUERY_KEY,
+        queryFn: fetchMyMembership,
+      });
+    } catch {
+      setLoading(false);
+      setError("No se pudo cargar tu acceso. Comprueba la conexión e inténtalo de nuevo.");
       return;
     }
 
-    if (!memberships || memberships.length === 0) {
+    setLoading(false);
+
+    if (!membership) {
       navigate("/pending", { replace: true });
       return;
     }
 
-    const role = memberships[0].role;
-    navigate(role === "employee" ? "/worker" : "/admin", { replace: true });
+    const esAdmin = membership.role === "owner" || membership.role === "admin";
+    navigate(esAdmin ? "/admin" : "/worker", { replace: true });
+  }
+
+  if (checkingSession) {
+    return <div style={{ padding: 24 }}>Cargando...</div>;
   }
 
   return (

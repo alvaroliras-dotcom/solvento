@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { supabase } from "../lib/supabaseClient";
 
-type Membership = {
+export type Membership = {
   id: string;
   company_id: string;
   role: "owner" | "admin" | "employee";
@@ -10,41 +10,37 @@ type Membership = {
   margen_tolerancia_minutos: number;
 };
 
+export const MEMBERSHIP_QUERY_KEY = ["my_memberships"] as const;
+
+export async function fetchMyMembership(): Promise<Membership | null> {
+  const { data, error } = await supabase.rpc("my_memberships");
+  if (error) throw error;
+  const rows = (data ?? []) as Membership[];
+  // Si alguien tuviera alta en varias empresas, se prioriza la de
+  // administracion para no dejarle fuera del panel.
+  return (
+    rows.find((m) => m.role === "owner" || m.role === "admin") ?? rows[0] ?? null
+  );
+}
+
+// Antes cada pantalla (y cada componente) volvia a preguntar su empresa al
+// servidor: 3 o 4 llamadas por pantalla, y si una fallaba se mostraba "no
+// hay empresa". Ahora se pregunta una vez y se comparte.
+//
+// Tambien se distingue "no tiene empresa" de "no he podido preguntarlo":
+// confundirlos mandaba al trabajador a "acceso pendiente" por un simple
+// tropiezo de conexion.
 export function useActiveMembership() {
-  const [membership, setMembership] = useState<Membership | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const query = useQuery({
+    queryKey: MEMBERSHIP_QUERY_KEY,
+    queryFn: fetchMyMembership,
+    staleTime: 5 * 60 * 1000,
+    retry: 2,
+  });
 
-  // Antes, si esta consulta fallaba, el error se descartaba sin mas y el
-  // usuario se quedaba "sin empresa". La aplicacion lo mandaba entonces a
-  // la pantalla de acceso pendiente, que no tiene ningun boton, y el
-  // trabajador se quedaba encerrado sin poder fichar por un simple
-  // tropiezo de conexion. Ahora se distingue "no tiene empresa" de "no he
-  // podido preguntarlo".
-  useEffect(() => {
-    let cancelado = false;
-
-    (async () => {
-      try {
-        const { data, error: rpcError } = await supabase.rpc("my_memberships");
-        if (cancelado) return;
-
-        if (rpcError) {
-          setError(rpcError.message);
-        } else if (data && data.length > 0) {
-          setMembership(data[0]);
-        }
-      } catch {
-        if (!cancelado) setError("No se ha podido conectar.");
-      } finally {
-        if (!cancelado) setLoading(false);
-      }
-    })();
-
-    return () => {
-      cancelado = true;
-    };
-  }, []);
-
-  return { membership, loading, error };
+  return {
+    membership: query.data ?? null,
+    loading: query.isLoading,
+    error: query.error ? (query.error as Error).message || "No se ha podido conectar." : null,
+  };
 }

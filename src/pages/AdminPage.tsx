@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { supabase } from "../lib/supabaseClient";
 import { fetchAllRows } from "../lib/fetchAllRows";
+import { formatFechaHoraMadrid, formatFechaMadrid } from "../lib/madrid";
 import { useActiveMembership } from "../app/useActiveMembership";
 import { adminTheme } from "../ui/adminTheme";
 
@@ -32,6 +33,7 @@ type TimeEntryForMetrics = {
   user_id: string;
   check_in_at: string;
   check_out_at: string | null;
+  workflow_status: string | null;
 };
 
 type UserMetrics = {
@@ -84,17 +86,10 @@ function formatMinutesHm(totalMinutes: number) {
   return `${h}h ${m}m`;
 }
 
-function formatLocalDate(d: Date) {
-  return `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}/${d.getFullYear()}`;
-}
-
-function formatLocalTime(d: Date) {
-  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-}
-
+// Antes se formateaba con getHours() (zona del navegador). Ahora
+// siempre en hora de Madrid, que es la del registro legal.
 function formatLocalDateTime(iso: string) {
-  const d = new Date(iso);
-  return `${formatLocalDate(d)} ${formatLocalTime(d)}`;
+  return formatFechaHoraMadrid(iso);
 }
 
 function minutesToHHMM(mins: number | "") {
@@ -174,8 +169,12 @@ function csvEscape(value: unknown) {
       ? String(value)
       : JSON.stringify(value);
 
-  const needsQuotes = /[",\n\r;]/.test(s);
-  const escaped = s.replace(/"/g, '""');
+  // Antes un nombre o motivo que empezara por = + - @ se abria en Excel
+  // como formula (CSV injection). Ahora se neutraliza con un apostrofo.
+  const safe = /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
+
+  const needsQuotes = /[",\n\r;]/.test(safe);
+  const escaped = safe.replace(/"/g, '""');
   return needsQuotes ? `"${escaped}"` : escaped;
 }
 
@@ -284,6 +283,15 @@ export function AdminPage() {
   const [fromDateStr, setFromDateStr] = useState(() => toDateInputValue(today));
   const [toDateStr, setToDateStr] = useState(() => toDateInputValue(today));
 
+  // Antes un doble clic en Validar/Rechazar lanzaba dos resoluciones.
+  // Ahora se bloquea la incidencia mientras se resuelve.
+  const [resolvingId, setResolvingId] = useState<string | null>(null);
+
+  // Antes, al cambiar de rango con una carga en curso, la respuesta vieja
+  // podia llegar la ultima y dejar datos (y CSV) de otro periodo. Ahora
+  // cada carga lleva su numero y se descarta si ya no es la ultima.
+  const loadReqRef = useRef(0);
+
   // ======================================================
   // PARTE 3/6 — DERIVADOS Y CÁLCULOS
   // ======================================================
@@ -372,6 +380,9 @@ export function AdminPage() {
 
     for (const r of rows) {
       if (!r.check_out_at) continue;
+      // Antes las jornadas rechazadas sumaban horas. Ahora no computan
+      // (las pendientes si: casi todas son "mas de 7 h" por revisar).
+      if (r.workflow_status === "rejected") continue;
 
       const inMs = new Date(r.check_in_at).getTime();
       const outMs = new Date(r.check_out_at).getTime();
@@ -455,10 +466,14 @@ export function AdminPage() {
   async function load() {
     if (!membership) return;
 
+    const reqId = ++loadReqRef.current;
+    const esVieja = () => reqId !== loadReqRef.current;
+
     setLoading(true);
     setError(null);
 
     await loadProfilesForCompany(membership.company_id);
+    if (esVieja()) return;
 
     const { data: manualData, error: manualError } = await supabase.rpc(
       "admin_pending_adjustments",
@@ -466,6 +481,8 @@ export function AdminPage() {
         p_company_id: membership.company_id,
       }
     );
+
+    if (esVieja()) return;
 
     if (manualError) {
       setError(manualError.message);
@@ -502,6 +519,8 @@ export function AdminPage() {
           .range(desde, hasta),
     );
 
+    if (esVieja()) return;
+
     if (autoError) {
       setError(autoError.message);
       setItems([]);
@@ -533,11 +552,19 @@ export function AdminPage() {
     // La bandeja de incidencias se alimenta de tres sitios y este panel
     // solo miraba dos: el contador de la portada decia 86 cuando en la
     // pantalla de incidencias habia 334.
-    const { data: solicitudRows, error: solicitudError } = await supabase
-      .from("time_entry_requests")
-      .select("id,time_entry_id,requested_by,requested_at,reason,status")
-      .eq("company_id", membership.company_id)
-      .eq("status", "pending");
+    // Por bloques: sin paginar se cortaba a 1.000 solicitudes en silencio.
+    const { data: solicitudRows, error: solicitudError } = await fetchAllRows(
+      (desde, hasta) =>
+        supabase
+          .from("time_entry_requests")
+          .select("id,time_entry_id,requested_by,requested_at,reason,status")
+          .eq("company_id", membership.company_id)
+          .eq("status", "pending")
+          .order("requested_at", { ascending: false })
+          .range(desde, hasta),
+    );
+
+    if (esVieja()) return;
 
     if (solicitudError) {
       setError(solicitudError.message);
@@ -577,6 +604,8 @@ export function AdminPage() {
       .is("check_out_at", null)
       .gte("check_in_at", inicioDeHoy);
 
+    if (esVieja()) return;
+
     if (openErr) {
       setError(openErr.message);
       setOpenCount(null);
@@ -594,6 +623,8 @@ export function AdminPage() {
       .order("check_in_at", { ascending: false })
       .limit(10);
 
+    if (esVieja()) return;
+
     if (openListErr) {
       setError(openListErr.message);
       setOpenEntries([]);
@@ -609,6 +640,8 @@ export function AdminPage() {
       .eq("company_id", membership.company_id)
       .gte("check_in_at", range.fromIso)
       .lt("check_in_at", range.toIsoExclusive);
+
+    if (esVieja()) return;
 
     if (entriesErr) {
       setError(entriesErr.message);
@@ -630,6 +663,8 @@ export function AdminPage() {
       .gte("check_out_at", range.fromIso)
       .lt("check_out_at", range.toIsoExclusive);
 
+    if (esVieja()) return;
+
     if (closesErr) {
       setError(closesErr.message);
       setEntriesInRange(null);
@@ -649,7 +684,7 @@ export function AdminPage() {
       (desde, hasta) =>
         supabase
           .from("time_entries")
-          .select("user_id,check_in_at,check_out_at")
+          .select("user_id,check_in_at,check_out_at,workflow_status")
           .eq("company_id", membership.company_id)
           .gte("check_in_at", range.fromIso)
           .lt("check_in_at", range.toIsoExclusive)
@@ -657,6 +692,8 @@ export function AdminPage() {
           .order("check_in_at", { ascending: true })
           .range(desde, hasta),
     );
+
+    if (esVieja()) return;
 
     if (metricErr) {
       setError(metricErr.message);
@@ -683,6 +720,8 @@ export function AdminPage() {
           .range(desde, hasta),
     );
 
+    if (esVieja()) return;
+
     if (inspErr) {
       setError(inspErr.message);
       setInspectionEntries([]);
@@ -695,6 +734,7 @@ export function AdminPage() {
   }
 
   async function resolveManual(adjustmentId: string, decision: "validated" | "rejected") {
+    if (resolvingId) return;
     setError(null);
 
     if (!resolutionReason || resolutionReason.trim().length < 3) {
@@ -702,19 +742,24 @@ export function AdminPage() {
       return;
     }
 
-    const { error } = await supabase.rpc("resolve_time_entry_adjustment", {
-      p_adjustment_id: adjustmentId,
-      p_decision: decision,
-      p_resolution_reason: resolutionReason.trim(),
-    });
+    setResolvingId(adjustmentId);
+    try {
+      const { error } = await supabase.rpc("resolve_time_entry_adjustment", {
+        p_adjustment_id: adjustmentId,
+        p_decision: decision,
+        p_resolution_reason: resolutionReason.trim(),
+      });
 
-    if (error) {
-      setError(error.message);
-      return;
+      if (error) {
+        setError(error.message);
+        return;
+      }
+
+      setResolutionReason("");
+      await load();
+    } finally {
+      setResolvingId(null);
     }
-
-    setResolutionReason("");
-    await load();
   }
 
   function openIncidentsPage() {
@@ -782,6 +827,8 @@ export function AdminPage() {
         check_out_at_utc: r.check_out_at ?? "",
         duracion_minutos: minutes,
         duracion_hm: typeof minutes === "number" ? formatMinutesHm(minutes) : "",
+        // La fila rechazada se mantiene (trazabilidad) pero no computa.
+        computa: r.workflow_status === "rejected" ? "No" : "Sí",
         status: r.status ?? "",
         workflow_status: r.workflow_status ?? "",
         created_at_utc: r.created_at ?? "",
@@ -802,9 +849,8 @@ export function AdminPage() {
     setError(null);
 
     const rows = (inspectionEntries ?? []).map((r) => {
-      const inDate = new Date(r.check_in_at);
       const outDate = r.check_out_at ? new Date(r.check_out_at) : null;
-      const inMs = inDate.getTime();
+      const inMs = new Date(r.check_in_at).getTime();
       const outMs = outDate ? outDate.getTime() : null;
       const minutes = outMs && outMs > inMs ? Math.floor((outMs - inMs) / 60000) : "";
       const p = profilesById[r.user_id];
@@ -816,11 +862,13 @@ export function AdminPage() {
         Empresa: membership.company_id,
         Trabajador: trabajador || email || r.user_id,
         Email: email,
-        Fecha: formatLocalDate(inDate),
+        Fecha: formatFechaMadrid(r.check_in_at),
         "Entrada (local)": formatLocalDateTime(r.check_in_at),
         "Salida (local)": r.check_out_at ? formatLocalDateTime(r.check_out_at) : "",
         "Duración (HH:MM)": minutesToHHMM(minutes),
         "Duración (min)": minutes,
+        // La fila rechazada se mantiene (trazabilidad) pero no computa.
+        Computa: r.workflow_status === "rejected" ? "No" : "Sí",
         Estado: r.status ?? "",
         Workflow: r.workflow_status ?? "",
         Flags: summarizeFlags(r.flags),
@@ -836,6 +884,7 @@ export function AdminPage() {
       "Salida (local)",
       "Duración (HH:MM)",
       "Duración (min)",
+      "Computa",
       "Estado",
       "Workflow",
       "Flags",
@@ -1247,7 +1296,7 @@ export function AdminPage() {
                       <tr key={g.user_id}>
                         <td>{displayUser(g.user_id)}</td>
                         <td className="adminRight">{g.count}</td>
-                        <td>{new Date(g.latest_created_at).toLocaleString()}</td>
+                        <td>{formatFechaHoraMadrid(g.latest_created_at)}</td>
                         <td className="adminRight">
                           <button className="adminBtn primary" onClick={() => goToWorker(g.user_id)}>
                             Ver ficha
@@ -1262,11 +1311,14 @@ export function AdminPage() {
           </section>
 
           <section className="adminCard">
-            <h2 className="adminCardTitle">Jornadas abiertas</h2>
-            <p className="adminCardSub">Últimas 10</p>
+            {/* Antes se rotulaba "Jornadas abiertas" junto a "Trabajando ahora"
+                (que solo cuenta las de hoy), pero la lista incluye olvidos de
+                dias anteriores. Ahora se llama por lo que es. */}
+            <h2 className="adminCardTitle">Jornadas sin cerrar</h2>
+            <p className="adminCardSub">Últimas 10, incluidas las de días anteriores</p>
 
             {!loading && openEntries.length === 0 && (
-              <p className="adminCardSub">No hay nadie en turno ahora mismo.</p>
+              <p className="adminCardSub">No hay jornadas sin cerrar.</p>
             )}
 
             {!loading && openEntries.length > 0 && (
@@ -1283,7 +1335,7 @@ export function AdminPage() {
                     {openEntries.map((e) => (
                       <tr key={e.id}>
                         <td>{displayUser(e.user_id)}</td>
-                        <td>{new Date(e.check_in_at).toLocaleString()}</td>
+                        <td>{formatFechaHoraMadrid(e.check_in_at)}</td>
                         <td className="adminRight">{formatElapsedHm(e.check_in_at)}</td>
                       </tr>
                     ))}
@@ -1307,10 +1359,12 @@ export function AdminPage() {
                 placeholder="Motivo de resolución para incidencias manuales"
               />
 
+              {/* Antes se podia exportar mientras cargaba el nuevo rango y
+                  salian datos del rango anterior. Ahora se espera a la carga. */}
               <button
                 className="adminBtn"
                 onClick={() => onExport("summary")}
-                disabled={exporting !== null || metricsByUser.length === 0}
+                disabled={loading || exporting !== null || metricsByUser.length === 0}
               >
                 {exporting === "summary" ? "Exportando…" : "CSV Resumen"}
               </button>
@@ -1318,7 +1372,7 @@ export function AdminPage() {
               <button
                 className="adminBtn"
                 onClick={() => onExport("detail")}
-                disabled={exporting !== null}
+                disabled={loading || exporting !== null}
               >
                 {exporting === "detail" ? "Exportando…" : "CSV Detalle"}
               </button>
@@ -1326,7 +1380,7 @@ export function AdminPage() {
               <button
                 className="adminBtn primary"
                 onClick={() => onExport("inspection")}
-                disabled={exporting !== null}
+                disabled={loading || exporting !== null}
               >
                 {exporting === "inspection" ? "Exportando…" : "Inspección"}
               </button>
@@ -1358,8 +1412,8 @@ export function AdminPage() {
                       <tr key={it.adjustment_id}>
                         <td>{getIncidentTypeLabel(it.source_type)}</td>
                         <td>{displayUser(it.user_id)}</td>
-                        <td>{new Date(it.check_in_at).toLocaleString()}</td>
-                        <td>{new Date(it.proposed_check_out).toLocaleString()}</td>
+                        <td>{formatFechaHoraMadrid(it.check_in_at)}</td>
+                        <td>{formatFechaHoraMadrid(it.proposed_check_out)}</td>
                         <td>{formatReason(it.reason)}</td>
                         <td className="adminRight">
                           {isAutomaticIncident(it) ? (
@@ -1374,6 +1428,7 @@ export function AdminPage() {
                               <button
                                 className="adminBtn primary"
                                 onClick={() => resolveManual(it.adjustment_id, "validated")}
+                                disabled={resolvingId !== null}
                                 style={{ marginRight: 8 }}
                               >
                                 Validar
@@ -1381,6 +1436,7 @@ export function AdminPage() {
                               <button
                                 className="adminBtn danger"
                                 onClick={() => resolveManual(it.adjustment_id, "rejected")}
+                                disabled={resolvingId !== null}
                               >
                                 Rechazar
                               </button>

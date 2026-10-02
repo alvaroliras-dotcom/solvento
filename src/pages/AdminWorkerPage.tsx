@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { supabase } from "../lib/supabaseClient";
+import { fetchAllRows } from "../lib/fetchAllRows";
 import { useActiveMembership } from "../app/useActiveMembership";
 import { adminTheme } from "../ui/adminTheme";
 
@@ -258,6 +259,15 @@ export function AdminWorkerPage() {
 
   const [resolutionReason, setResolutionReason] = useState<string>("");
 
+  // Antes un doble clic en Validar/Rechazar lanzaba dos resoluciones.
+  // Ahora se bloquea mientras se resuelve.
+  const [resolvingId, setResolvingId] = useState<string | null>(null);
+
+  // Antes, al cambiar de rango o de trabajador con una carga en curso, la
+  // respuesta vieja podia llegar la ultima y pisar la buena. Ahora solo
+  // se aplica la respuesta de la ultima carga.
+  const loadReqRef = useRef(0);
+
   const [selectedGeoEntry, setSelectedGeoEntry] = useState<TimeEntryRow | null>(null);
 
   // ======================================================
@@ -422,6 +432,9 @@ export function AdminWorkerPage() {
   async function load() {
     if (!membership || !userId) return;
 
+    const reqId = ++loadReqRef.current;
+    const esVieja = () => reqId !== loadReqRef.current;
+
     setLoading(true);
     setError(null);
 
@@ -432,6 +445,8 @@ export function AdminWorkerPage() {
       { p_company_id: membership.company_id }
     );
 
+    if (esVieja()) return;
+
     if (profErr) {
       setError("No se ha podido cargar la ficha: " + profErr.message);
       setProfile(null);
@@ -440,16 +455,24 @@ export function AdminWorkerPage() {
       setProfile(list.find((p) => p.id === userId) ?? null);
     }
 
-    const { data: rows, error: entriesErr } = await supabase
-      .from("time_entries")
-      .select(
-        "id,user_id,check_in_at,check_out_at,status,workflow_status,created_at,approved_at,flags,check_in_geo_lat,check_in_geo_lng,check_in_geo_accuracy_m,check_out_geo_lat,check_out_geo_lng,check_out_geo_accuracy_m"
-      )
-      .eq("company_id", membership.company_id)
-      .eq("user_id", userId)
-      .gte("check_in_at", range.fromIso)
-      .lt("check_in_at", range.toIsoExclusive)
-      .order("check_in_at", { ascending: false });
+    // Por bloques: sin paginar se cortaba a 1.000 tramos en silencio y el
+    // total de horas de rangos largos salia por debajo del real.
+    const { data: rows, error: entriesErr } = await fetchAllRows<TimeEntryRow>(
+      (desde, hasta) =>
+        supabase
+          .from("time_entries")
+          .select(
+            "id,user_id,check_in_at,check_out_at,status,workflow_status,created_at,approved_at,flags,check_in_geo_lat,check_in_geo_lng,check_in_geo_accuracy_m,check_out_geo_lat,check_out_geo_lng,check_out_geo_accuracy_m"
+          )
+          .eq("company_id", membership.company_id)
+          .eq("user_id", userId)
+          .gte("check_in_at", range.fromIso)
+          .lt("check_in_at", range.toIsoExclusive)
+          .order("check_in_at", { ascending: false })
+          .range(desde, hasta),
+    );
+
+    if (esVieja()) return;
 
     if (entriesErr) {
       setError(entriesErr.message);
@@ -469,7 +492,9 @@ export function AdminWorkerPage() {
     for (const e of list) {
       const dur = safeDurationMinutes(e.check_in_at, e.check_out_at);
       if (dur !== null) {
-        minutes += dur;
+        // Antes los tramos rechazados sumaban en "Total horas". Ahora no
+        // computan; los pendientes si (suelen ser "mas de 7 h" por revisar).
+        if (e.workflow_status !== "rejected") minutes += dur;
         closed += 1;
       } else if (!e.check_out_at) {
         open += 1;
@@ -484,6 +509,8 @@ export function AdminWorkerPage() {
       "admin_pending_adjustments",
       { p_company_id: membership.company_id }
     );
+
+    if (esVieja()) return;
 
     if (pendErr) {
       setError(pendErr.message);
@@ -507,14 +534,21 @@ export function AdminWorkerPage() {
         source_type: "manual",
       }));
 
-    const { data: autoRows, error: autoErr } = await supabase
-      .from("time_entries")
-      .select("id,user_id,check_in_at,check_out_at,flags")
-      .eq("company_id", membership.company_id)
-      .eq("user_id", userId)
-      .eq("workflow_status", "pending")
-      .gte("check_in_at", range.fromIso)
-      .lt("check_in_at", range.toIsoExclusive);
+    const { data: autoRows, error: autoErr } = await fetchAllRows(
+      (desde, hasta) =>
+        supabase
+          .from("time_entries")
+          .select("id,user_id,check_in_at,check_out_at,flags")
+          .eq("company_id", membership.company_id)
+          .eq("user_id", userId)
+          .eq("workflow_status", "pending")
+          .gte("check_in_at", range.fromIso)
+          .lt("check_in_at", range.toIsoExclusive)
+          .order("check_in_at", { ascending: false })
+          .range(desde, hasta),
+    );
+
+    if (esVieja()) return;
 
     if (autoErr) {
       setError(autoErr.message);
@@ -550,6 +584,7 @@ export function AdminWorkerPage() {
     adjustmentId: string,
     decision: "validated" | "rejected"
   ) {
+    if (resolvingId) return;
     setError(null);
 
     if (!resolutionReason || resolutionReason.trim().length < 3) {
@@ -557,19 +592,24 @@ export function AdminWorkerPage() {
       return;
     }
 
-    const { error } = await supabase.rpc("resolve_time_entry_adjustment", {
-      p_adjustment_id: adjustmentId,
-      p_decision: decision,
-      p_resolution_reason: resolutionReason.trim(),
-    });
+    setResolvingId(adjustmentId);
+    try {
+      const { error } = await supabase.rpc("resolve_time_entry_adjustment", {
+        p_adjustment_id: adjustmentId,
+        p_decision: decision,
+        p_resolution_reason: resolutionReason.trim(),
+      });
 
-    if (error) {
-      setError(error.message);
-      return;
+      if (error) {
+        setError(error.message);
+        return;
+      }
+
+      setResolutionReason("");
+      await load();
+    } finally {
+      setResolvingId(null);
     }
-
-    setResolutionReason("");
-    await load();
   }
 
   function openIncidentsPage() {
@@ -1172,6 +1212,7 @@ export function AdminWorkerPage() {
                       <button
                         className="adminWorkerBtn primary"
                         onClick={() => resolveManual(it.adjustment_id, "validated")}
+                        disabled={resolvingId !== null}
                       >
                         Validar
                       </button>
@@ -1179,6 +1220,7 @@ export function AdminWorkerPage() {
                       <button
                         className="adminWorkerBtn danger"
                         onClick={() => resolveManual(it.adjustment_id, "rejected")}
+                        disabled={resolvingId !== null}
                       >
                         Rechazar
                       </button>

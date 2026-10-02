@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
 import { fetchAllRows } from "../lib/fetchAllRows";
+import { claveDiaMadrid, formatFechaHoraMadrid, formatFechaMadrid, formatHoraMadrid } from "../lib/madrid";
 import { useActiveMembership } from "../app/useActiveMembership";
 import { adminTheme } from "../ui/adminTheme";
 
@@ -24,7 +25,7 @@ type Profile = {
   full_name: string | null;
 };
 
-type ExportType = "inspection" | "company_summary" | "worker_detail";
+type ExportType = "inspection" | "company_summary" | "worker_detail" | "daily_register";
 type Preset = "today" | "week" | "month" | "custom";
 
 type PreviewRow = {
@@ -39,10 +40,6 @@ type PreviewRow = {
   workflow_status: string;
   flags: any | null;
 };
-
-function pad2(n: number) {
-  return String(n).padStart(2, "0");
-}
 
 function toDateInputValue(d: Date) {
   const year = d.getFullYear();
@@ -82,9 +79,10 @@ function startOfLocalMonth(d: Date) {
   return x;
 }
 
+// Antes se formateaba con getHours() (zona del navegador). Ahora
+// siempre en hora de Madrid, que es la del registro legal.
 function formatLocalDateTime(iso: string) {
-  const d = new Date(iso);
-  return `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}/${d.getFullYear()} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  return formatFechaHoraMadrid(iso);
 }
 
 function formatOptionalLocalDateTime(value: unknown) {
@@ -101,6 +99,17 @@ function safeDurationMinutes(checkInIso: string, checkOutIso: string | null) {
   const diff = outMs - inMs;
   if (!Number.isFinite(diff) || diff <= 0) return 0;
   return Math.floor(diff / 60000);
+}
+
+// Antes las jornadas rechazadas por el administrador seguian sumando
+// horas en totales y resumenes. Ahora no computan; las pendientes si
+// (la mayoria solo estan marcadas por superar 7 h y estan por revisar).
+function computa(row: { workflow_status: string | null }) {
+  return row.workflow_status !== "rejected";
+}
+
+function minutosComputables(row: { workflow_status: string | null; duration_minutes: number }) {
+  return computa(row) ? row.duration_minutes : 0;
 }
 
 function formatMinutes(mins: number) {
@@ -121,8 +130,12 @@ function csvEscape(value: unknown) {
       ? String(value)
       : JSON.stringify(value);
 
-  const needsQuotes = /[",\n\r;]/.test(s);
-  const escaped = s.replace(/"/g, '""');
+  // Antes un nombre o motivo que empezara por = + - @ se abria en Excel
+  // como formula (CSV injection). Ahora se neutraliza con un apostrofo.
+  const safe = /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
+
+  const needsQuotes = /[",\n\r;]/.test(safe);
+  const escaped = safe.replace(/"/g, '""');
   return needsQuotes ? `"${escaped}"` : escaped;
 }
 
@@ -268,6 +281,8 @@ function getInspectionExportRow(r: PreviewRow) {
     Salida: r.check_out_at ? formatLocalDateTime(r.check_out_at) : "",
     "Duración (min)": r.duration_minutes,
     Duración: formatMinutes(r.duration_minutes),
+    // La fila rechazada se mantiene (trazabilidad) pero no computa.
+    Computa: computa(r) ? "Sí" : "No",
     Estado: translateStatus(r.status),
     Workflow: translateWorkflow(r.workflow_status),
     "Motivo incidencia": getInspectionReason(r),
@@ -283,6 +298,76 @@ function getInspectionExportRow(r: PreviewRow) {
     "Salida original": getAdminOldCheckOutAt(r),
     "Salida corregida": getAdminNewCheckOutAt(r),
   };
+}
+
+// Registro diario para inspeccion: una fila por trabajador y dia de
+// Madrid (no por tramo). Las rechazadas cuentan como tramo pero no suman.
+function buildDailyRegisterRows(source: PreviewRow[]) {
+  type Dia = {
+    worker_name: string;
+    worker_email: string;
+    dia: string;
+    primeraEntrada: string;
+    ultimaSalida: string | null;
+    hayAbierta: boolean;
+    tramos: number;
+    minutos: number;
+    pendientes: boolean;
+  };
+
+  const map = new Map<string, Dia>();
+
+  for (const r of source) {
+    const dia = claveDiaMadrid(r.check_in_at);
+    const key = `${r.user_id}|${dia}`;
+    let item = map.get(key);
+    if (!item) {
+      item = {
+        worker_name: r.worker_name,
+        worker_email: r.worker_email,
+        dia,
+        primeraEntrada: r.check_in_at,
+        ultimaSalida: null,
+        hayAbierta: false,
+        tramos: 0,
+        minutos: 0,
+        pendientes: false,
+      };
+      map.set(key, item);
+    }
+
+    item.tramos += 1;
+    item.minutos += minutosComputables(r);
+    if (r.workflow_status === "pending") item.pendientes = true;
+    if (new Date(r.check_in_at).getTime() < new Date(item.primeraEntrada).getTime()) {
+      item.primeraEntrada = r.check_in_at;
+    }
+    if (!r.check_out_at) {
+      item.hayAbierta = true;
+    } else if (
+      !item.ultimaSalida ||
+      new Date(r.check_out_at).getTime() > new Date(item.ultimaSalida).getTime()
+    ) {
+      item.ultimaSalida = r.check_out_at;
+    }
+  }
+
+  return Array.from(map.values())
+    .sort((a, b) => a.worker_name.localeCompare(b.worker_name) || a.dia.localeCompare(b.dia))
+    .map((d) => ({
+      Trabajador: d.worker_name,
+      Email: d.worker_email,
+      Fecha: formatFechaMadrid(d.primeraEntrada),
+      "Primera entrada": formatHoraMadrid(d.primeraEntrada),
+      "Última salida": d.hayAbierta
+        ? "Sin cerrar"
+        : d.ultimaSalida
+        ? formatHoraMadrid(d.ultimaSalida)
+        : "",
+      "Nº tramos": d.tramos,
+      "Horas computables": (d.minutos / 60).toFixed(2).replace(".", ","),
+      "Incidencias pendientes": d.pendientes ? "Sí" : "No",
+    }));
 }
 
 // ======================================================
@@ -304,6 +389,11 @@ export function AdminExportsPage() {
   const [previewRows, setPreviewRows] = useState<PreviewRow[]>([]);
   const [selectedExportType, setSelectedExportType] = useState<ExportType>("inspection");
   const [selectedWorkerId, setSelectedWorkerId] = useState<string>("all");
+
+  // Antes, si se cambiaba de rango con una carga en curso, la respuesta
+  // vieja podia llegar la ultima y pisar la nueva (exportando otro
+  // periodo). Ahora cada carga lleva su numero y solo vale la ultima.
+  const reqRef = useRef(0);
 
   // ======================================================
   // PARTE 3/6 — RANGO, FILTROS Y MÉTRICAS
@@ -355,7 +445,7 @@ export function AdminExportsPage() {
     const baseRows = selectedWorkerId === "all" ? previewRows : filteredPreviewRows;
 
     const totalEntries = baseRows.length;
-    const totalMinutes = baseRows.reduce((acc, row) => acc + row.duration_minutes, 0);
+    const totalMinutes = baseRows.reduce((acc, row) => acc + minutosComputables(row), 0);
     const openEntries = baseRows.filter((row) => !row.check_out_at).length;
     const incidentEntries = baseRows.filter(
       (row) => row.workflow_status === "pending"
@@ -415,7 +505,7 @@ export function AdminExportsPage() {
 
       const item = map.get(key)!;
       item["Jornadas"] += 1;
-      item["Horas totales (min)"] += row.duration_minutes;
+      item["Horas totales (min)"] += minutosComputables(row);
       if (!row.check_out_at) item["Jornadas abiertas"] += 1;
       if (row.workflow_status === "pending") item["Incidencias"] += 1;
     }
@@ -455,6 +545,7 @@ export function AdminExportsPage() {
   async function loadPreviewData() {
     if (!membership) return;
 
+    const reqId = ++reqRef.current;
     setPreviewLoading(true);
     setError(null);
 
@@ -466,7 +557,12 @@ export function AdminExportsPage() {
       { p_company_id: membership.company_id }
     );
 
+    if (reqId !== reqRef.current) return;
+
+    // Antes, en error, se quedaban en pantalla (y exportables) las filas
+    // del periodo anterior. Ahora se vacian.
     if (profilesError) {
+      setPreviewRows([]);
       setPreviewLoading(false);
       setError(profilesError.message);
       return;
@@ -490,7 +586,10 @@ export function AdminExportsPage() {
         .range(desde, hasta),
     );
 
+    if (reqId !== reqRef.current) return;
+
     if (error) {
+      setPreviewRows([]);
       setPreviewLoading(false);
       setError(error.message);
       return;
@@ -542,6 +641,7 @@ export function AdminExportsPage() {
             "Salida",
             "Duración (min)",
             "Duración",
+            "Computa",
             "Estado",
             "Workflow",
             "Motivo incidencia",
@@ -583,6 +683,7 @@ export function AdminExportsPage() {
           Entrada: formatLocalDateTime(r.check_in_at),
           Salida: r.check_out_at ? formatLocalDateTime(r.check_out_at) : "",
           "Duración (min)": r.duration_minutes,
+          Computa: computa(r) ? "Sí" : "No",
           Estado: translateStatus(r.status),
           Workflow: translateWorkflow(r.workflow_status),
           "Motivo incidencia": getInspectionReason(r),
@@ -594,7 +695,29 @@ export function AdminExportsPage() {
         downloadCsv(
           `cerbero_detalle_${selectedWorkerName}_${fromDateStr}_a_${toDateStr}.csv`,
           rows,
-          ["Trabajador", "Email", "Entrada", "Salida", "Duración (min)", "Estado", "Workflow", "Motivo incidencia"]
+          ["Trabajador", "Email", "Entrada", "Salida", "Duración (min)", "Computa", "Estado", "Workflow", "Motivo incidencia"]
+        );
+      }
+
+      if (type === "daily_register") {
+        const source =
+          selectedWorkerId === "all"
+            ? previewRows
+            : previewRows.filter((r) => r.user_id === selectedWorkerId);
+
+        downloadCsv(
+          `cerbero_registro_diario_${fromDateStr}_a_${toDateStr}.csv`,
+          buildDailyRegisterRows(source),
+          [
+            "Trabajador",
+            "Email",
+            "Fecha",
+            "Primera entrada",
+            "Última salida",
+            "Nº tramos",
+            "Horas computables",
+            "Incidencias pendientes",
+          ]
         );
       }
 
@@ -1124,6 +1247,20 @@ export function AdminExportsPage() {
                   {loading && selectedExportType === "worker_detail" ? "Exportando..." : "Descargar CSV"}
                 </button>
               </article>
+
+              <article className={`adminExpTypeCard ${selectedExportType === "daily_register" ? "active" : ""}`}>
+                <h3 className="adminExpTypeTitle">Registro diario (inspección)</h3>
+                <p className="adminExpTypeText">
+                  Una fila por trabajador y día: primera entrada, última salida, tramos, horas computables e incidencias pendientes.
+                </p>
+                <button
+                  className="adminExpBtn primary"
+                  onClick={() => exportCsv("daily_register")}
+                  disabled={loading || previewLoading || previewRows.length === 0}
+                >
+                  {loading && selectedExportType === "daily_register" ? "Exportando..." : "Descargar CSV"}
+                </button>
+              </article>
             </div>
 
             <div className="adminExpControls">
@@ -1270,6 +1407,11 @@ export function AdminExportsPage() {
                 <strong>Detalle por trabajador</strong>
                 <div>Exportación individual filtrada para seguimiento o revisión puntual.</div>
               </div>
+
+              <div className="adminExpListItem">
+                <strong>Registro diario (inspección)</strong>
+                <div>Una fila por trabajador y día (hora de Madrid). Las jornadas rechazadas no suman horas.</div>
+              </div>
             </div>
           </section>
 
@@ -1285,7 +1427,8 @@ export function AdminExportsPage() {
                 <div>
                   {selectedExportType === "inspection" && "Inspección laboral"}
                   {selectedExportType === "company_summary" && "Resumen empresa"}
-                  {selectedExportType === "worker_detail" && "Detalle por trabajador"} · {rangeLabel}
+                  {selectedExportType === "worker_detail" && "Detalle por trabajador"}
+                  {selectedExportType === "daily_register" && "Registro diario (inspección)"} · {rangeLabel}
                 </div>
               </div>
 

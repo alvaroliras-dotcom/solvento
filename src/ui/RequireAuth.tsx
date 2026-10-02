@@ -1,12 +1,37 @@
 import { useEffect, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
-import { useNavigate, useLocation } from "react-router-dom";
+import { Navigate, useLocation, useNavigate } from "react-router-dom";
+import { useQueryClient } from "@tanstack/react-query";
 import { useActiveMembership } from "../app/useActiveMembership";
 
 export function RequireAuth({ children }: { children: React.ReactNode }) {
   const navigate = useNavigate();
   const location = useLocation();
-  const [loading, setLoading] = useState(true);
+  const queryClient = useQueryClient();
+  const [sessionState, setSessionState] = useState<"loading" | "in" | "out">(
+    "loading",
+  );
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      setSessionState(data.session ? "in" : "out");
+    });
+
+    const { data: listener } = supabase.auth.onAuthStateChange(
+      (_event, session) => {
+        if (!session) {
+          // Al salir se olvida todo lo cargado, para que otra persona en el
+          // mismo dispositivo no vea datos del anterior.
+          queryClient.clear();
+          setSessionState("out");
+        }
+      },
+    );
+
+    return () => {
+      listener.subscription.unsubscribe();
+    };
+  }, [queryClient]);
 
   const {
     membership,
@@ -14,28 +39,8 @@ export function RequireAuth({ children }: { children: React.ReactNode }) {
     error: membershipError,
   } = useActiveMembership();
 
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      if (!data.session) {
-        navigate("/login", { replace: true });
-      }
-      setLoading(false);
-    });
-
-    const { data: listener } = supabase.auth.onAuthStateChange(
-      (_event, session) => {
-        if (!session) {
-          navigate("/login", { replace: true });
-        }
-      }
-    );
-
-    return () => {
-      listener.subscription.unsubscribe();
-    };
-  }, [navigate]);
-
-  if (loading || membershipLoading) return <div>Cargando...</div>;
+  if (sessionState === "out") return <Navigate to="/login" replace />;
+  if (sessionState === "loading" || membershipLoading) return <div>Cargando...</div>;
 
   // Un fallo al comprobar el acceso no es lo mismo que no tener empresa.
   // Mandar aqui al trabajador a "acceso pendiente" le dejaba sin poder
@@ -66,24 +71,19 @@ export function RequireAuth({ children }: { children: React.ReactNode }) {
     );
   }
 
-  if (!membership) {
-    navigate("/pending", { replace: true });
-    return null;
+  if (!membership) return <Navigate to="/pending" replace />;
+
+  // Proteccion por rol: el panel solo para owner/admin; la pantalla de
+  // fichar solo para empleados. (La seguridad de verdad esta en la base de
+  // datos; esto solo evita que cada uno acabe en la pantalla que no es.)
+  const esAdmin = membership.role === "owner" || membership.role === "admin";
+
+  if (location.pathname.startsWith("/admin") && !esAdmin) {
+    return <Navigate to="/worker" replace />;
   }
 
-  // 🔒 Protección por rol
-  if (location.pathname.startsWith("/admin")) {
-    if (membership.role === "employee") {
-      navigate("/worker", { replace: true });
-      return null;
-    }
-  }
-
-  if (location.pathname.startsWith("/worker")) {
-    if (membership.role !== "employee") {
-      navigate("/admin", { replace: true });
-      return null;
-    }
+  if (location.pathname.startsWith("/worker") && esAdmin) {
+    return <Navigate to="/admin" replace />;
   }
 
   return <>{children}</>;
