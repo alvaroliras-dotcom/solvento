@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
+import { fetchAllRows } from "../lib/fetchAllRows";
 import { useActiveMembership } from "../app/useActiveMembership";
 import { adminTheme } from "../ui/adminTheme";
 
@@ -114,6 +115,11 @@ export function AdminSettingsPage() {
 
   const [loading, setLoading] = useState(true);
   const [savingCalendar, setSavingCalendar] = useState(false);
+
+  // Antes, si fallaba la carga, el formulario se quedaba con los horarios
+  // por defecto y "Guardar" sobrescribia el calendario real con ellos.
+  // Ahora solo se puede guardar si el calendario se ha cargado bien.
+  const [calendarLoaded, setCalendarLoaded] = useState(false);
   const [savingHoliday, setSavingHoliday] = useState(false);
   const [savingAbsence, setSavingAbsence] = useState(false);
   const [markingRequestId, setMarkingRequestId] = useState<string | null>(null);
@@ -154,9 +160,12 @@ export function AdminSettingsPage() {
     if (!membership?.company_id) return;
 
     setLoading(true);
+    setCalendarLoaded(false);
     setError(null);
     setSuccess(null);
 
+    // Festivos, ausencias y solicitudes por bloques: sin paginar se
+    // cortaban a 1.000 filas en silencio.
     const [calendarRes, holidaysRes, profilesRes, absencesRes, requestsRes] = await Promise.all([
       supabase
         .from("company_work_calendar")
@@ -166,27 +175,36 @@ export function AdminSettingsPage() {
         .eq("company_id", membership.company_id)
         .maybeSingle(),
 
-      supabase
-        .from("company_holidays")
-        .select("id,holiday_date,name")
-        .eq("company_id", membership.company_id)
-        .order("holiday_date", { ascending: true }),
+      fetchAllRows<HolidayRow>((desde, hasta) =>
+        supabase
+          .from("company_holidays")
+          .select("id,holiday_date,name")
+          .eq("company_id", membership.company_id)
+          .order("holiday_date", { ascending: true })
+          .range(desde, hasta),
+      ),
 
       supabase.rpc("admin_company_profiles", {
         p_company_id: membership.company_id,
       }),
 
-      supabase
-        .from("worker_absences")
-        .select("id,company_id,user_id,absence_type,start_date,end_date,note,created_at")
-        .eq("company_id", membership.company_id)
-        .order("start_date", { ascending: true }),
+      fetchAllRows<WorkerAbsenceRow>((desde, hasta) =>
+        supabase
+          .from("worker_absences")
+          .select("id,company_id,user_id,absence_type,start_date,end_date,note,created_at")
+          .eq("company_id", membership.company_id)
+          .order("start_date", { ascending: true })
+          .range(desde, hasta),
+      ),
 
-      supabase
-        .from("worker_requests")
-        .select("id,company_id,user_id,type,start_date,end_date,comment,status,created_at,read_at")
-        .eq("company_id", membership.company_id)
-        .order("created_at", { ascending: false }),
+      fetchAllRows<WorkerRequestRow>((desde, hasta) =>
+        supabase
+          .from("worker_requests")
+          .select("id,company_id,user_id,type,start_date,end_date,comment,status,created_at,read_at")
+          .eq("company_id", membership.company_id)
+          .order("created_at", { ascending: false })
+          .range(desde, hasta),
+      ),
     ]);
 
     if (calendarRes.error) {
@@ -228,6 +246,7 @@ export function AdminSettingsPage() {
       setAfternoonStart(calendar.afternoon_start ?? "15:30");
       setDayEnd(calendar.day_end ?? "18:00");
     }
+    setCalendarLoaded(true);
 
     const nextWorkers = ((profilesRes.data ?? []) as Profile[])
       .map((p) => ({
@@ -336,14 +355,22 @@ export function AdminSettingsPage() {
     setError(null);
     setSuccess(null);
 
-    const { error: deleteError } = await supabase
+    const { data: borrados, error: deleteError } = await supabase
       .from("company_holidays")
       .delete()
       .eq("company_id", membership.company_id)
-      .eq("id", id);
+      .eq("id", id)
+      .select("id");
 
     if (deleteError) {
       setError(deleteError.message);
+      return;
+    }
+
+    // Antes, si el permiso (RLS) no dejaba borrar, no daba error y se
+    // decia "eliminado". Ahora se comprueba que se ha borrado algo.
+    if (borrados?.length === 0) {
+      setError("No se ha podido completar (sin permiso o ya no existe)");
       return;
     }
 
@@ -413,14 +440,21 @@ export function AdminSettingsPage() {
     setError(null);
     setSuccess(null);
 
-    const { error: deleteError } = await supabase
+    const { data: borrados, error: deleteError } = await supabase
       .from("worker_absences")
       .delete()
       .eq("company_id", membership.company_id)
-      .eq("id", id);
+      .eq("id", id)
+      .select("id");
 
     if (deleteError) {
       setError(deleteError.message);
+      return;
+    }
+
+    // Sin permiso (RLS) el borrado no falla: simplemente no borra nada.
+    if (borrados?.length === 0) {
+      setError("No se ha podido completar (sin permiso o ya no existe)");
       return;
     }
 
@@ -433,17 +467,25 @@ export function AdminSettingsPage() {
     setError(null);
     setSuccess(null);
 
-    const { error: updateError } = await supabase
+    const { data: marcados, error: updateError } = await supabase
       .from("worker_requests")
       .update({
         status: "read",
         read_at: new Date().toISOString(),
       })
-      .eq("id", id);
+      .eq("id", id)
+      .select("id");
 
     if (updateError) {
       setMarkingRequestId(null);
       setError(updateError.message);
+      return;
+    }
+
+    // Sin permiso (RLS) la actualizacion no falla: no cambia nada.
+    if (marcados?.length === 0) {
+      setMarkingRequestId(null);
+      setError("No se ha podido completar (sin permiso o ya no existe)");
       return;
     }
 
@@ -478,15 +520,23 @@ async function deleteWorkerRequest(id: string) {
   setError(null);
   setSuccess(null);
 
-  const { error: deleteError } = await supabase
+  const { data: borrados, error: deleteError } = await supabase
     .from("worker_requests")
     .delete()
     .eq("company_id", membership.company_id)
-    .eq("id", id);
+    .eq("id", id)
+    .select("id");
 
   if (deleteError) {
     setMarkingRequestId(null);
     setError(deleteError.message);
+    return;
+  }
+
+  // Sin permiso (RLS) el borrado no falla: simplemente no borra nada.
+  if (borrados?.length === 0) {
+    setMarkingRequestId(null);
+    setError("No se ha podido completar (sin permiso o ya no existe)");
     return;
   }
 
@@ -1002,7 +1052,7 @@ async function deleteWorkerRequest(id: string) {
                 type="button"
                 className="adminSettingsBtn primary"
                 onClick={saveCalendar}
-                disabled={savingCalendar}
+                disabled={savingCalendar || !calendarLoaded || !!error}
               >
                 {savingCalendar ? "Guardando..." : "Guardar configuración"}
               </button>

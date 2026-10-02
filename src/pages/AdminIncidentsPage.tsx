@@ -1,6 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { supabase } from "../lib/supabaseClient";
+import { fetchAllRows } from "../lib/fetchAllRows";
+import {
+  claveDiaMadrid,
+  formatFechaHoraMadrid,
+  inicioHoyMadridIso,
+  instanteDesdeMadrid,
+} from "../lib/madrid";
 import { useActiveMembership } from "../app/useActiveMembership";
 import { adminTheme } from "../ui/adminTheme";
 
@@ -59,8 +66,10 @@ type CalendarRow = {
   day_end: string | null;
 };
 
+// Antes toLocaleString() sin zona: la hora dependia del navegador de quien
+// miraba. Ahora siempre en hora de Madrid.
 function formatDateTime(value: string) {
-  return new Date(value).toLocaleString();
+  return formatFechaHoraMadrid(value);
 }
 
 // ======================================================
@@ -194,16 +203,17 @@ function getIncidentTypeLabel(sourceType: IncidentSourceType) {
   return "Manual";
 }
 
+// "Hoy" es el dia de Madrid, no el del navegador.
 function getTodayRangeIso() {
-  const start = new Date();
-  start.setHours(0, 0, 0, 0);
+  const fromIso = inicioHoyMadridIso();
 
-  const end = new Date(start);
-  end.setDate(end.getDate() + 1);
+  const [y, m, d] = claveDiaMadrid(new Date()).split("-").map(Number);
+  const manana = new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+  const end = instanteDesdeMadrid(manana, 0, 0);
 
   return {
-    fromIso: start.toISOString(),
-    toIsoExclusive: end.toISOString(),
+    fromIso,
+    toIsoExclusive: (end ?? new Date(new Date(fromIso).getTime() + 86400000)).toISOString(),
   };
 }
 
@@ -239,14 +249,24 @@ function getMadridDateParts(value: string) {
   };
 }
 
+// Antes devolvia "AAAA-MM-DDTHH:mm:00" sin zona (el navegador lo leia como
+// su hora local) y con horas base tardias salia "24:xx" -> Invalid Date.
+// Ahora se construye el instante real con el desfase de Madrid de ese dia
+// y se acota a las 23:59.
 function buildMadridDeadlineIso(requestedAt: string, baseTime: string) {
   const { year, month, day } = getMadridDateParts(requestedAt);
-  const deadlineMinutes = timeStringToMinutes(baseTime) + 45;
+  const baseMinutes = timeStringToMinutes(baseTime);
+  if (!Number.isFinite(baseMinutes)) return requestedAt;
 
-  const hh = String(Math.floor(deadlineMinutes / 60)).padStart(2, "0");
-  const mm = String(deadlineMinutes % 60).padStart(2, "0");
+  const deadlineMinutes = Math.min(baseMinutes + 45, 23 * 60 + 59);
 
-  return `${year}-${month}-${day}T${hh}:${mm}:00`;
+  const instante = instanteDesdeMadrid(
+    `${year}-${month}-${day}`,
+    Math.floor(deadlineMinutes / 60),
+    deadlineMinutes % 60,
+  );
+
+  return instante ? instante.toISOString() : requestedAt;
 }
 
 function getTimeRequestFallbackIso(
@@ -288,7 +308,11 @@ function getTimeRequestFallbackIso(
 
 export function AdminIncidentsPage() {
   const navigate = useNavigate();
-  const { membership } = useActiveMembership();
+  const {
+    membership,
+    loading: membershipLoading,
+    error: membershipError,
+  } = useActiveMembership();
 
   const [incidents, setIncidents] = useState<Incident[]>([]);
 
@@ -297,12 +321,25 @@ export function AdminIncidentsPage() {
   // nada" de "no se ha podido cargar".
   const [loadError, setLoadError] = useState<string | null>(null);
   const [profilesById, setProfilesById] = useState<Record<string, Profile>>({});
-  const [loading, setLoading] = useState(false);
+  // Antes empezaba en false y, hasta que arrancaba la carga, la bandeja
+  // decia "No hay incidencias pendientes". Ahora empieza cargando.
+  const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
+
+  // Si no se ha podido saber la empresa (o no hay), no se queda en
+  // "Cargando…" para siempre; y el fallo se muestra como error, no como
+  // bandeja vacia.
+  const tableLoading = loading && (membershipLoading || !!membership);
+  const tableError = loadError ?? membershipError;
 
   const [selectedIncident, setSelectedIncident] = useState<Incident | null>(null);
   const [selectedEntryGeo, setSelectedEntryGeo] = useState<EntryGeoDetail | null>(null);
   const [loadingEntryGeo, setLoadingEntryGeo] = useState(false);
+
+  // Antes, si se abria una incidencia y enseguida otra, la ubicacion de
+  // la primera podia llegar tarde y mostrarse en la segunda. Ahora se
+  // descarta la respuesta si ya no es la incidencia abierta.
+  const openEntryIdRef = useRef<string | null>(null);
   const [resolutionReason, setResolutionReason] = useState("");
 
   const [finalCheckIn, setFinalCheckIn] = useState("");
@@ -332,23 +369,50 @@ const [rejectedToday, setRejectedToday] = useState(0);
 
     const { fromIso, toIsoExclusive } = getTodayRangeIso();
 
-    const { data, error } = await supabase
-      .from("time_entries")
-      .select("workflow_status,approved_at,flags")
-      .eq("company_id", membership.company_id)
-      .in("workflow_status", ["adjusted", "rejected"]);
+    // Antes se descargaba TODO el historico ajustado/rechazado para contar
+    // solo los de hoy (y se cortaba a 1.000 filas). Ahora se filtra en el
+    // servidor por fecha de resolucion (o approved_at si no la hay).
+    const { data, error } = await fetchAllRows<ResolutionStatsRow>((desde, hasta) =>
+      supabase
+        .from("time_entries")
+        .select("workflow_status,approved_at,flags")
+        .eq("company_id", membership.company_id)
+        .in("workflow_status", ["adjusted", "rejected"])
+        .or(
+          `flags->>admin_resolution_at.gte."${fromIso}",approved_at.gte."${fromIso}"`,
+        )
+        .order("id", { ascending: true })
+        .range(desde, hasta),
+    );
 
     if (error) {
       setValidatedToday(0);
       setRejectedToday(0);
+      setLoadError("No se han podido contar las resueltas hoy: " + error.message);
       return;
     }
 
-    const { data: requestRows } = await supabase
-      .from("time_entry_requests")
-      .select("status,resolved_at,time_entry_id")
-      .eq("company_id", membership.company_id)
-      .in("status", ["approved", "rejected"]);
+    const { data: requestRows, error: requestStatsError } = await fetchAllRows<{
+      status: string;
+      resolved_at: string | null;
+      time_entry_id: string | null;
+    }>((desde, hasta) =>
+      supabase
+        .from("time_entry_requests")
+        .select("status,resolved_at,time_entry_id")
+        .eq("company_id", membership.company_id)
+        .in("status", ["approved", "rejected"])
+        .gte("resolved_at", fromIso)
+        .order("id", { ascending: true })
+        .range(desde, hasta),
+    );
+
+    if (requestStatsError) {
+      setValidatedToday(0);
+      setRejectedToday(0);
+      setLoadError("No se han podido contar las resueltas hoy: " + requestStatsError.message);
+      return;
+    }
 
     let validated = 0;
     let rejected = 0;
@@ -399,11 +463,19 @@ const [rejectedToday, setRejectedToday] = useState(0);
     setLoading(true);
     setLoadError(null);
 
-    const { data: calendarData } = await supabase
+    // Antes los errores de calendario, jornadas enlazadas y nombres se
+    // tragaban en silencio. Ahora se avisan (sin vaciar la bandeja).
+    const avisos: string[] = [];
+
+    const { data: calendarData, error: calendarError } = await supabase
       .from("company_work_calendar")
       .select("morning_start,lunch_start,afternoon_start,day_end")
       .eq("company_id", membership.company_id)
       .maybeSingle<CalendarRow>();
+
+    if (calendarError) {
+      avisos.push("calendario: " + calendarError.message);
+    }
 
     const { data: manualData, error: manualError } = await supabase.rpc(
       "admin_pending_adjustments",
@@ -423,11 +495,16 @@ const [rejectedToday, setRejectedToday] = useState(0);
         source_type: "manual",
       }));
 
-    const { data: autoRows, error: autoError } = await supabase
-      .from("time_entries")
-      .select("id,user_id,check_in_at,check_out_at,flags")
-      .eq("company_id", membership.company_id)
-      .eq("workflow_status", "pending");
+    // Por bloques: sin paginar se cortaba a 1.000 incidencias en silencio.
+    const { data: autoRows, error: autoError } = await fetchAllRows((desde, hasta) =>
+      supabase
+        .from("time_entries")
+        .select("id,user_id,check_in_at,check_out_at,flags")
+        .eq("company_id", membership.company_id)
+        .eq("workflow_status", "pending")
+        .order("check_in_at", { ascending: false })
+        .range(desde, hasta),
+    );
 
     if (autoError) {
       setLoadError(autoError.message);
@@ -450,12 +527,17 @@ const [rejectedToday, setRejectedToday] = useState(0);
         source_type: "automatic",
       })) ?? [];
 
-    const { data: requestRows, error: requestError } = await supabase
-      .from("time_entry_requests")
-      .select("id,time_entry_id,requested_by,requested_at,reason,status")
-      .eq("company_id", membership.company_id)
-      .eq("status", "pending")
-      .returns<TimeRequestRow[]>();
+    const { data: requestRows, error: requestError } = await fetchAllRows<TimeRequestRow>(
+      (desde, hasta) =>
+        supabase
+          .from("time_entry_requests")
+          .select("id,time_entry_id,requested_by,requested_at,reason,status")
+          .eq("company_id", membership.company_id)
+          .eq("status", "pending")
+          .order("requested_at", { ascending: false })
+          .range(desde, hasta)
+          .returns<TimeRequestRow[]>(),
+    );
 
     if (requestError) {
       setLoadError(requestError.message);
@@ -474,11 +556,19 @@ const [rejectedToday, setRejectedToday] = useState(0);
 
     const entriesById: Record<string, { check_in_at: string | null; check_out_at: string | null }> = {};
 
-    if (requestTimeEntryIds.length > 0) {
-      const { data: linkedEntries } = await supabase
+    // En lotes de 100: con muchos ids la URL de un solo .in() se hacia
+    // demasiado larga y la consulta fallaba.
+    for (let i = 0; i < requestTimeEntryIds.length; i += 100) {
+      const lote = requestTimeEntryIds.slice(i, i + 100);
+      const { data: linkedEntries, error: linkedError } = await supabase
         .from("time_entries")
         .select("id,check_in_at,check_out_at")
-        .in("id", requestTimeEntryIds);
+        .in("id", lote);
+
+      if (linkedError) {
+        avisos.push("jornadas enlazadas: " + linkedError.message);
+        break;
+      }
 
       for (const entry of linkedEntries ?? []) {
         entriesById[entry.id] = {
@@ -518,9 +608,14 @@ const [rejectedToday, setRejectedToday] = useState(0);
 
     // Con la version que solo devuelve activos, las incidencias de quien
     // ya causo baja aparecian en la bandeja como un codigo largo.
-    const { data: profilesData } = await supabase.rpc("admin_company_profiles_all", {
-      p_company_id: membership.company_id,
-    });
+    const { data: profilesData, error: profilesError } = await supabase.rpc(
+      "admin_company_profiles_all",
+      { p_company_id: membership.company_id },
+    );
+
+    if (profilesError) {
+      avisos.push("nombres de trabajadores: " + profilesError.message);
+    }
 
     const map: Record<string, Profile> = {};
     for (const p of (profilesData ?? []) as Profile[]) {
@@ -528,6 +623,10 @@ const [rejectedToday, setRejectedToday] = useState(0);
     }
 
     setProfilesById(map);
+
+    if (avisos.length > 0) {
+      setLoadError("Carga incompleta (" + avisos.join("; ") + ")");
+    }
 
     await loadResolutionStats();
     setLoading(false);
@@ -559,21 +658,6 @@ const [rejectedToday, setRejectedToday] = useState(0);
       }
     }
 
-    // Sin los datos del fichaje cargados, guardar borraría la ubicación,
-    // la distancia al centro y el motivo original de la incidencia.
-    if (
-      isAutomaticIncident(selectedIncident) &&
-      selectedIncident.time_entry_id &&
-      !selectedEntryGeo
-    ) {
-      alert(
-        "No se han podido cargar los datos del fichaje.\n\n" +
-          "Cierra la incidencia, recarga la página y vuelve a abrirla. " +
-          "Si se guarda ahora, se perderían la ubicación y el motivo original.",
-      );
-      return;
-    }
-
     setResolving(true);
 
     if (isTimeRequestIncident(selectedIncident)) {
@@ -595,168 +679,56 @@ const [rejectedToday, setRejectedToday] = useState(0);
       return;
     }
 
-    if (isAutomaticIncident(selectedIncident)) {
-      const previousCheckOutAt =
-        selectedEntryGeo?.flags?.admin_new_check_out_at ?? selectedIncident.proposed_check_out;
+    // Todo se resuelve ahora en una sola operacion en el servidor. Antes el
+    // navegador hacia el cambio y despues, aparte, el registro de auditoria:
+    // si fallaba el segundo paso el cambio quedaba sin rastro, dos
+    // administradores a la vez se pisaban, las marcas del fichaje se
+    // reescribian con la copia del navegador y la hora de entrada corregida
+    // se aplicaba en un tercer paso.
+    const nextCheckIn = fromDateTimeLocalValue(finalCheckIn);
+    const nextCheckOut = fromDateTimeLocalValue(finalCheckOut);
 
-      const nextFlags = {
-        ...(selectedEntryGeo?.flags ?? {}),
-        admin_resolution_decision: decision,
-        admin_resolution_reason: reason,
-        admin_resolution_at: new Date().toISOString(),
-        incident_closed_from_backoffice: true,
-      };
-
-
-      const updatePayload: Record<string, any> = {
-        workflow_status: decision === "validated" ? "adjusted" : "rejected",
-        flags: nextFlags,
-      };
-
-      if (decision === "validated") {
-        const nextCheckIn = fromDateTimeLocalValue(finalCheckIn);
-        const nextCheckOut = fromDateTimeLocalValue(finalCheckOut);
-
-        if (nextCheckIn) {
-          updatePayload.check_in_at = nextCheckIn;
-        }
-
-        if (nextCheckOut) {
-          updatePayload.check_out_at = nextCheckOut;
-        }
-      }
-
-      const { error } = await supabase
-        .from("time_entries")
-        .update(updatePayload)
-        .eq("id", selectedIncident.time_entry_id);
-
-      if (error) {
-        setResolving(false);
-        alert(error.message);
-        return;
-      }
-
-      // El registro de auditoria ya no se escribe directamente desde el
-      // navegador: lo hace la funcion log_time_entry_action, que comprueba
-      // que quien la llama es administrador de esa empresa y firma la linea
-      // con su propio identificador. Asi la tabla no se puede falsear.
-      const { error: logError } = await supabase.rpc("log_time_entry_action", {
-        p_company_id: membership?.company_id,
-        p_time_entry_id: selectedIncident.time_entry_id,
-        p_action:
-          decision === "validated"
-            ? "automatic_incident_validated"
-            : "automatic_incident_rejected",
-        p_old_values: {
-          check_in_at: selectedIncident.check_in_at,
-          check_out_at: previousCheckOutAt,
-          workflow_status: "pending",
-        },
-        p_new_values: {
-          check_in_at:
-            fromDateTimeLocalValue(finalCheckIn) ?? selectedIncident.check_in_at,
-          check_out_at:
-            fromDateTimeLocalValue(finalCheckOut) ?? previousCheckOutAt,
-          workflow_status: decision === "validated" ? "adjusted" : "rejected",
-          resolution_reason: reason,
-        },
-      });
-
-      if (logError) {
-        alert(
-          "La incidencia se ha resuelto, pero no ha quedado registrada en el " +
-            "historial de cambios: " +
-            logError.message,
-        );
-      }
-
-      setResolving(false);
-      closeIncidentModal();
-      await loadIncidents();
-      return;
-    }
-
-    // ----------------------------------------------------
-    // INCIDENCIA MANUAL (pedida por el trabajador)
-    // ----------------------------------------------------
-    // La función de base de datos solo sabe corregir la SALIDA.
-    // Antes, la hora de entrada que escribía el administrador se
-    // descartaba en silencio: pulsaba validar, parecía que había
-    // funcionado, y la entrada seguía igual.
-    // Ahora la salida la sigue corrigiendo la función, y la
-    // entrada se aplica aquí y se deja registrada.
-
-    const nextCheckOut =
-      decision === "validated" ? fromDateTimeLocalValue(finalCheckOut) : null;
-
-    const nextCheckIn =
-      decision === "validated" ? fromDateTimeLocalValue(finalCheckIn) : null;
-
-
-    const { error } = await supabase.rpc("resolve_time_entry_adjustment", {
-      p_adjustment_id: selectedIncident.adjustment_id,
-      p_decision: decision,
-      p_resolution_reason: reason,
-      p_final_check_out: nextCheckOut,
-    });
-
-    if (error) {
-      setResolving(false);
-      alert(error.message);
-      return;
-    }
-
-    const checkInChanged =
-      !!nextCheckIn && !sameInstant(nextCheckIn, selectedIncident.check_in_at);
-
-    if (checkInChanged && selectedIncident.time_entry_id) {
-      const { error: checkInError } = await supabase
-        .from("time_entries")
-        .update({ check_in_at: nextCheckIn })
-        .eq("id", selectedIncident.time_entry_id);
-
-      if (checkInError) {
-        setResolving(false);
-        alert(
-          "La salida se ha corregido, pero la entrada no: " +
-            checkInError.message,
-        );
-        return;
-      }
-
-      const { error: checkInLogError } = await supabase.rpc(
-        "log_time_entry_action",
-        {
-          p_company_id: membership?.company_id,
+    const { error } = isAutomaticIncident(selectedIncident)
+      ? await supabase.rpc("resolve_automatic_incident", {
           p_time_entry_id: selectedIncident.time_entry_id,
-          p_action: "check_in_corrected",
-          p_old_values: {
-            check_in_at: selectedIncident.check_in_at,
-          },
-          p_new_values: {
-            check_in_at: nextCheckIn,
-            resolution_reason: reason,
-          },
-        },
-      );
-
-      if (checkInLogError) {
-        alert(
-          "La entrada se ha corregido, pero el cambio no ha quedado " +
-            "registrado en el historial: " +
-            checkInLogError.message,
-        );
-      }
-    }
+          p_decision: decision,
+          p_resolution_reason: reason,
+          p_check_in: decision === "validated" ? nextCheckIn : null,
+          // Una jornada que seguia abierta se cierra con esta hora tambien
+          // al rechazarla; si no, el trabajador no podia fichar al dia
+          // siguiente.
+          p_check_out: nextCheckOut,
+        })
+      : await supabase.rpc("resolve_time_entry_adjustment", {
+          p_adjustment_id: selectedIncident.adjustment_id,
+          p_decision: decision,
+          p_resolution_reason: reason,
+          p_final_check_out: decision === "validated" ? nextCheckOut : null,
+          p_final_check_in:
+            decision === "validated" &&
+            nextCheckIn &&
+            !sameInstant(nextCheckIn, selectedIncident.check_in_at)
+              ? nextCheckIn
+              : null,
+        });
 
     setResolving(false);
+
+    if (error) {
+      alert(error.message);
+      if (/ya (la ha resuelto|esta resuelta)/i.test(error.message)) {
+        closeIncidentModal();
+        await loadIncidents();
+      }
+      return;
+    }
 
     closeIncidentModal();
     await loadIncidents();
   }
 
   async function openIncidentModal(item: Incident) {
+    openEntryIdRef.current = item.time_entry_id;
     setSelectedIncident(item);
     setSelectedEntryGeo(null);
     setLoadingEntryGeo(true);
@@ -781,6 +753,9 @@ const [rejectedToday, setRejectedToday] = useState(0);
       .eq("id", item.time_entry_id)
       .maybeSingle();
 
+    // Ya se ha cerrado o se ha abierto otra incidencia: se descarta.
+    if (openEntryIdRef.current !== item.time_entry_id) return;
+
     if (!error && data) {
       setSelectedEntryGeo(data as EntryGeoDetail);
     } else {
@@ -791,6 +766,7 @@ const [rejectedToday, setRejectedToday] = useState(0);
   }
 
   function closeIncidentModal() {
+    openEntryIdRef.current = null;
     setSelectedIncident(null);
     setSelectedEntryGeo(null);
     setLoadingEntryGeo(false);
@@ -1380,7 +1356,7 @@ const [rejectedToday, setRejectedToday] = useState(0);
                 </tr>
               ))}
 
-              {!loading && loadError && (
+              {!tableLoading && tableError && (
                 <tr>
                   <td
                     colSpan={6}
@@ -1396,13 +1372,13 @@ const [rejectedToday, setRejectedToday] = useState(0);
                     página y, si sigue igual, avisa antes de dar el día por
                     revisado.
                     <div style={{ fontWeight: 500, marginTop: 6, fontSize: 12 }}>
-                      Detalle técnico: {loadError}
+                      Detalle técnico: {tableError}
                     </div>
                   </td>
                 </tr>
               )}
 
-              {!loading && !loadError && filteredIncidents.length === 0 && (
+              {!tableLoading && !tableError && filteredIncidents.length === 0 && (
                 <tr>
                   <td colSpan={6} className="adminIncEmpty">
                     No hay incidencias pendientes.
@@ -1410,7 +1386,7 @@ const [rejectedToday, setRejectedToday] = useState(0);
                 </tr>
               )}
 
-              {loading && (
+              {tableLoading && (
                 <tr>
                   <td colSpan={6} className="adminIncEmpty">
                     Cargando…
@@ -1791,7 +1767,7 @@ const [rejectedToday, setRejectedToday] = useState(0);
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
                       <button
                         className="adminIncBtn primary"
-                        disabled={resolving}
+                        disabled={resolving || loadingEntryGeo}
                         onClick={() => resolveIncident("validated")}
                         style={{ width: "100%" }}
                       >
@@ -1800,7 +1776,7 @@ const [rejectedToday, setRejectedToday] = useState(0);
 
                       <button
                         className="adminIncBtn danger"
-                        disabled={resolving}
+                        disabled={resolving || loadingEntryGeo}
                         onClick={() => resolveIncident("rejected")}
                         style={{ width: "100%" }}
                       >
