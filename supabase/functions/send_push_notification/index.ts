@@ -146,6 +146,14 @@ serve(async (req) => {
       return jsonResponse(405, { ok: false, error: "Method not allowed" });
     }
 
+    // Solo el propio servidor (la tarea automatica) puede mandar avisos.
+    // Antes cualquiera con la clave publica de la app podia enviar a
+    // cualquier trabajador un aviso con el texto que quisiera.
+    const auth = req.headers.get("Authorization") ?? "";
+    if (auth !== `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`) {
+      return jsonResponse(401, { ok: false, error: "No autorizado" });
+    }
+
     const payload = await req.json();
 
     if (!validatePayload(payload)) {

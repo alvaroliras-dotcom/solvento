@@ -196,7 +196,13 @@ export function WorkerHistoryPage() {
       map.get(key)!.push(item);
     }
 
-    return Array.from(map.entries()).map(([key, items]) => {
+    return Array.from(map.entries()).map(([key, desordenados]) => {
+      // Dentro de cada dia, de la mañana a la tarde: antes "Tramo 1" era el
+      // ultimo del dia.
+      const items = [...desordenados].sort(
+        (a, b) => new Date(a.check_in_at).getTime() - new Date(b.check_in_at).getTime(),
+      );
+
       const totalMinutes = items.reduce(
         (acc, item) => acc + (minutesBetween(item.check_in_at, item.check_out_at) ?? 0),
         0

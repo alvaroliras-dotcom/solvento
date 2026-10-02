@@ -308,6 +308,7 @@ export function WorkerPage() {
   const {
   data: openEntry,
   isLoading,
+  isError: openEntryFailed,
   refetch: refetchOpenEntry,
 } = useOpenEntry(activeCompany, userId);
   const checkIn = useCheckIn(activeCompany, userId);
@@ -1177,7 +1178,7 @@ export function WorkerPage() {
             <button
               className="workerMainButton"
               onClick={onMainPress}
-              disabled={isBusy || isMainBlocked}
+              disabled={isBusy || isMainBlocked || openEntryFailed}
             >
               <div className="workerMainButtonInner">
                 <BracketArrowIcon direction={isOpen ? "out" : "in"} />
@@ -1185,6 +1186,22 @@ export function WorkerPage() {
               </div>
             </button>
           </div>
+
+          {/* Si no se sabe si hay una jornada abierta, el boton podia mostrar
+              ENTRAR cuando en realidad tocaba SALIR. */}
+          {openEntryFailed && (
+            <div className="workerMessage error" role="alert">
+              No se ha podido comprobar tu jornada. Revisa la conexión.
+              <button
+                type="button"
+                className="workerAdjustBtn"
+                style={{ display: "block", margin: "10px auto 0" }}
+                onClick={() => refetchOpenEntry()}
+              >
+                Reintentar
+              </button>
+            </div>
+          )}
 
           {push.needsPermission && (
             <div className="workerMessage">

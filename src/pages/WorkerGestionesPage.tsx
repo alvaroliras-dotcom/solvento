@@ -63,16 +63,22 @@ function hhmmFromMinutes(totalMinutes: number) {
   return `${pad2(h)}:${pad2(m)}`;
 }
 
+// Separador ";" y marca BOM: es lo que espera Excel en español. Con comas y
+// sin BOM el archivo se abria en una sola columna y con los acentos rotos.
+const CSV_SEP = ";";
+
 function csvEscape(value: string | number | null | undefined) {
-  const text = String(value ?? "");
-  if (text.includes('"') || text.includes(",") || text.includes("\n")) {
+  let text = String(value ?? "");
+  // Un texto que empieza por = + - @ Excel lo ejecuta como formula.
+  if (/^[=+\-@]/.test(text)) text = `'${text}`;
+  if (text.includes('"') || text.includes(CSV_SEP) || text.includes(",") || text.includes("\n")) {
     return `"${text.replace(/"/g, '""')}"`;
   }
   return text;
 }
 
 function downloadTextFile(filename: string, content: string) {
-  const blob = new Blob([content], { type: "text/csv;charset=utf-8;" });
+  const blob = new Blob(["﻿" + content], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -80,7 +86,8 @@ function downloadTextFile(filename: string, content: string) {
   document.body.appendChild(a);
   a.click();
   a.remove();
-  URL.revokeObjectURL(url);
+  // Liberarlo en el mismo instante abortaba la descarga en algunos iPhone.
+  window.setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
 function getWeekRange() {
@@ -352,8 +359,13 @@ export function WorkerGestionesPage() {
 
     supabase.auth
       .getUser()
-      .then(({ data }) => {
-        if (!cancelado) setUserId(data.user?.id ?? null);
+      .then(({ data, error: authError }) => {
+        if (cancelado) return;
+        if (authError || !data.user) {
+          setDownloadMessage("Tu sesión ha caducado o no hay conexión. Vuelve a entrar.");
+          return;
+        }
+        setUserId(data.user.id);
       })
       .catch(() => {
         if (!cancelado) {
@@ -443,7 +455,7 @@ export function WorkerGestionesPage() {
       const rows = (data ?? []) as CsvEntry[];
 
       const csvLines = [
-        ["Fecha", "Entrada", "Salida", "Tiempo", "Estado"].map(csvEscape).join(","),
+        ["Fecha", "Entrada", "Salida", "Tiempo", "Estado"].map(csvEscape).join(CSV_SEP),
         ...rows.map((row) =>
           [
             csvEscape(formatDateEs(row.check_in_at)),
@@ -455,8 +467,17 @@ export function WorkerGestionesPage() {
                 return m === null ? "pendiente de regularizar" : hhmmFromMinutes(m);
               })(),
             ),
-            csvEscape(row.workflow_status ?? ""),
-          ].join(",")
+            csvEscape(
+              ({
+                auto: "Correcto",
+                pending: "Pendiente de revisión",
+                adjusted: "Corregido por administración",
+                rejected: "Rechazado",
+              } as Record<string, string>)[row.workflow_status ?? ""] ??
+                row.workflow_status ??
+                "",
+            ),
+          ].join(CSV_SEP)
         ),
       ];
 
@@ -529,7 +550,19 @@ export function WorkerGestionesPage() {
           background: adminTheme.colors.pageBg,
         }}
       >
-        Cargando usuario...
+        {downloadMessage ? (
+          <>
+            <p>{downloadMessage}</p>
+            <button type="button" onClick={() => window.location.reload()}>
+              Reintentar
+            </button>{" "}
+            <button type="button" onClick={() => window.location.replace("/login")}>
+              Volver a entrar
+            </button>
+          </>
+        ) : (
+          "Cargando usuario..."
+        )}
       </div>
     );
   }

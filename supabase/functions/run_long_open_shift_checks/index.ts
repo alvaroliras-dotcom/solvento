@@ -68,8 +68,20 @@ function mensajePara(tipo: string) {
   }
 }
 
-Deno.serve(async () => {
+Deno.serve(async (req) => {
   const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
+
+  // Solo la puede lanzar el programador de tareas (cron), que manda la
+  // contraseña guardada en el almacen de secretos de la base de datos.
+  // Antes bastaba la clave publica de la app para dispararla.
+  const { data: autorizado } = await supabase.rpc("cron_secret_ok", {
+    p_secret: req.headers.get("x-cron-secret") ?? "",
+  });
+
+  if (autorizado !== true) {
+    return new Response(JSON.stringify({ ok: false, error: "No autorizado" }),
+      { status: 401, headers: { "Content-Type": "application/json" } });
+  }
 
   const hoy = madridHoy();
   const { hora, minuto } = madridHora();
