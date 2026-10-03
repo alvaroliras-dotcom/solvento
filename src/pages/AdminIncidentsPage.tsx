@@ -325,6 +325,8 @@ export function AdminIncidentsPage() {
   // decia "No hay incidencias pendientes". Ahora empieza cargando.
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
+  const [mesElegido, setMesElegido] = useState<string>("todas");
+  const [pagina, setPagina] = useState(1);
 
   // Si no se ha podido saber la empresa (o no hay), no se queda en
   // "Cargando…" para siempre; y el fallo se muestra como error, no como
@@ -800,6 +802,60 @@ const [rejectedToday, setRejectedToday] = useState(0);
     });
   }, [incidents, search, profilesById]);
 
+  // ------------------------------------------------------
+  // Meses y paginas. Con mas de cien pendientes la bandeja era un scroll
+  // sin fin. Ahora se agrupan por el mes del fichaje (hora de Madrid) y se
+  // ven de 20 en 20.
+  // ------------------------------------------------------
+  const POR_PAGINA = 20;
+
+  const mesDe = (item: Incident) =>
+    claveDiaMadrid(item.check_in_at || item.created_at).slice(0, 7);
+
+  const meses = useMemo(() => {
+    const cuenta = new Map<string, number>();
+    for (const item of filteredIncidents) {
+      const mes = mesDe(item);
+      if (mes) cuenta.set(mes, (cuenta.get(mes) ?? 0) + 1);
+    }
+    return Array.from(cuenta.entries()).sort((a, b) => b[0].localeCompare(a[0]));
+  }, [filteredIncidents]);
+
+  // Si el mes elegido se queda sin incidencias (todas resueltas o la
+  // busqueda no lo incluye) se vuelve a "Todas".
+  const mesActivo =
+    mesElegido !== "todas" && meses.some(([m]) => m === mesElegido) ? mesElegido : "todas";
+
+  const incidenciasDelMes = useMemo(
+    () =>
+      mesActivo === "todas"
+        ? filteredIncidents
+        : filteredIncidents.filter((item) => mesDe(item) === mesActivo),
+    [filteredIncidents, mesActivo],
+  );
+
+  const totalPaginas = Math.max(1, Math.ceil(incidenciasDelMes.length / POR_PAGINA));
+  const paginaActual = Math.min(pagina, totalPaginas);
+  const incidenciasPagina = incidenciasDelMes.slice(
+    (paginaActual - 1) * POR_PAGINA,
+    paginaActual * POR_PAGINA,
+  );
+
+  function nombreMes(clave: string) {
+    const [y, m] = clave.split("-").map(Number);
+    const texto = new Date(Date.UTC(y, m - 1, 15)).toLocaleDateString("es-ES", {
+      month: "long",
+      year: "numeric",
+      timeZone: "UTC",
+    });
+    return texto.charAt(0).toUpperCase() + texto.slice(1);
+  }
+
+  function elegirMes(mes: string) {
+    setMesElegido(mes);
+    setPagina(1);
+  }
+
   const flags = selectedEntryGeo?.flags ?? null;
 
    // ======================================================
@@ -859,6 +915,66 @@ const [rejectedToday, setRejectedToday] = useState(0);
           color: ${adminTheme.colors.text};
           font-weight: 700;
           cursor: pointer;
+        }
+
+        .adminIncBtn:disabled {
+          opacity: .45;
+          cursor: not-allowed;
+        }
+
+        .adminIncMeses {
+          display: flex;
+          gap: 8px;
+          overflow-x: auto;
+          padding: 12px 0 4px;
+          scrollbar-width: thin;
+        }
+
+        .adminIncMes {
+          flex: 0 0 auto;
+          height: 36px;
+          padding: 0 14px;
+          border: 1px solid ${adminTheme.colors.border};
+          border-radius: 999px;
+          background: ${adminTheme.colors.panelBg};
+          color: ${adminTheme.colors.text};
+          font-weight: 700;
+          cursor: pointer;
+          white-space: nowrap;
+        }
+
+        .adminIncMes.isActive {
+          background: ${adminTheme.colors.primary};
+          border-color: ${adminTheme.colors.primary};
+          color: ${adminTheme.colors.textOnPrimary};
+        }
+
+        .adminIncMesNum {
+          display: inline-block;
+          margin-left: 6px;
+          padding: 0 7px;
+          border-radius: 999px;
+          font-size: 12px;
+          line-height: 20px;
+          background: rgba(0, 0, 0, .08);
+        }
+
+        .adminIncMes.isActive .adminIncMesNum {
+          background: rgba(255, 255, 255, .25);
+        }
+
+        .adminIncPaginacion {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          margin-top: 12px;
+        }
+
+        .adminIncPaginaTexto {
+          font-weight: 700;
+          color: ${adminTheme.colors.textSoft};
+          text-align: center;
         }
 
         .adminIncBtn.primary {
@@ -1288,7 +1404,10 @@ const [rejectedToday, setRejectedToday] = useState(0);
           className="adminIncInput"
           placeholder="Buscar trabajador..."
           value={search}
-          onChange={(e) => setSearch(e.target.value)}
+          onChange={(e) => {
+            setSearch(e.target.value);
+            setPagina(1);
+          }}
         />
 
         <button className="adminIncBtn" onClick={loadIncidents}>
@@ -1322,7 +1441,31 @@ const [rejectedToday, setRejectedToday] = useState(0);
 
       <section className="adminIncCard">
         <h2 className="adminIncCardTitle">Incidencias</h2>
-        <p className="adminIncCardSub">Bandeja de incidencias pendientes</p>
+        <p className="adminIncCardSub">Bandeja de incidencias pendientes, por mes del fichaje</p>
+
+        {meses.length > 0 && (
+          <div className="adminIncMeses" role="tablist" aria-label="Mes">
+            <button
+              role="tab"
+              aria-selected={mesActivo === "todas"}
+              className={`adminIncMes ${mesActivo === "todas" ? "isActive" : ""}`}
+              onClick={() => elegirMes("todas")}
+            >
+              Todas <span className="adminIncMesNum">{filteredIncidents.length}</span>
+            </button>
+            {meses.map(([mes, total]) => (
+              <button
+                key={mes}
+                role="tab"
+                aria-selected={mesActivo === mes}
+                className={`adminIncMes ${mesActivo === mes ? "isActive" : ""}`}
+                onClick={() => elegirMes(mes)}
+              >
+                {nombreMes(mes)} <span className="adminIncMesNum">{total}</span>
+              </button>
+            ))}
+          </div>
+        )}
 
         <div className="adminIncTableWrap">
           <table className="adminIncTable">
@@ -1337,7 +1480,7 @@ const [rejectedToday, setRejectedToday] = useState(0);
               </tr>
             </thead>
             <tbody>
-              {filteredIncidents.map((item) => (
+              {incidenciasPagina.map((item) => (
                 <tr key={item.adjustment_id}>
                   <td>{getIncidentTypeLabel(item.source_type)}</td>
                   <td>{getWorkerLabel(item.user_id)}</td>
@@ -1396,6 +1539,34 @@ const [rejectedToday, setRejectedToday] = useState(0);
             </tbody>
           </table>
         </div>
+
+        {incidenciasDelMes.length > POR_PAGINA && (
+          <div className="adminIncPaginacion">
+            <button
+              className="adminIncBtn"
+              disabled={paginaActual <= 1}
+              onClick={() => setPagina(paginaActual - 1)}
+            >
+              ‹ Anterior
+            </button>
+            <span className="adminIncPaginaTexto">
+              Página {paginaActual} de {totalPaginas}
+              <span className="adminIncPaginaRango">
+                {" · "}
+                {(paginaActual - 1) * POR_PAGINA + 1}–
+                {Math.min(paginaActual * POR_PAGINA, incidenciasDelMes.length)} de{" "}
+                {incidenciasDelMes.length}
+              </span>
+            </span>
+            <button
+              className="adminIncBtn"
+              disabled={paginaActual >= totalPaginas}
+              onClick={() => setPagina(paginaActual + 1)}
+            >
+              Siguiente ›
+            </button>
+          </div>
+        )}
       </section>
 
       {selectedIncident && (
