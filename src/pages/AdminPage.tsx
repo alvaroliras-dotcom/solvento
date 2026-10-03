@@ -1457,6 +1457,21 @@ export function AdminPage() {
             <h2 className="adminCardTitle">Empleados</h2>
             <p className="adminCardSub">Buscar y abrir ficha</p>
 
+            {/* Las altas y bajas viven en la pantalla Empleados, pero su
+                acceso era solo un icono sin texto en el menu lateral y no
+                se encontraba. */}
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 12 }}>
+              <button
+                className="adminBtn primary"
+                onClick={() => navigate("/admin/employees?alta=1")}
+              >
+                + Dar de alta a un trabajador
+              </button>
+              <button className="adminBtn" onClick={() => navigate("/admin/employees")}>
+                Bajas, reactivaciones y PIN
+              </button>
+            </div>
+
             <div className="adminSearchRow">
               <input
                 className="adminInput"

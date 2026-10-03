@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { supabase } from "../lib/supabaseClient";
 import { useActiveMembership } from "../app/useActiveMembership";
 import { adminTheme } from "../ui/adminTheme";
@@ -49,6 +49,7 @@ function nombreDe(p: Persona) {
 
 export function AdminEmployeesPage() {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const { membership, loading: membershipLoading } = useActiveMembership();
 
   const [personas, setPersonas] = useState<Persona[]>([]);
@@ -174,6 +175,15 @@ export function AdminEmployeesPage() {
     loadEmployees();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [membership?.company_id]);
+
+  // Desde la portada, "Dar de alta" llega aqui con ?alta=1 y abre el
+  // formulario directamente.
+  useEffect(() => {
+    if (searchParams.get("alta") !== "1") return;
+    abrir({ tipo: "alta" });
+    setSearchParams({}, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
 
   const coincide = useMemo(() => {
     const q = search.trim().toLowerCase();
