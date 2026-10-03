@@ -72,3 +72,18 @@ Resumen de lo que cambio:
 
 Si se vuelve a desplegar una Edge Function desde aqui, el codigo de
 `supabase/functions/` es el que esta en produccion a 2 de octubre de 2026.
+
+## Altas y bajas desde el panel (3 de octubre de 2026)
+
+La pantalla de Empleados permite dar de alta, dar de baja, reactivar y
+cambiar el PIN. Lo hace la Edge Function `admin_manage_employee`
+(`supabase/functions/admin_manage_employee/`), que solo atiende a un
+owner/admin con alta activa y solo actua sobre trabajadores de su empresa.
+Cada accion queda en la tabla `employee_changes`.
+
+- Alta: crea el usuario con el correo y el PIN, le pone el nombre y le da
+  de alta en la empresa. Si el correo ya existia (antiguo trabajador), lo
+  reactiva con el PIN nuevo en vez de duplicarlo.
+- Baja: no borra nada. Pone la membresia en `inactive` con fecha y motivo,
+  bloquea el acceso del usuario y desactiva sus avisos. No deja dar de baja
+  a quien tiene una jornada abierta (hay que cerrarla antes con la hora real).
