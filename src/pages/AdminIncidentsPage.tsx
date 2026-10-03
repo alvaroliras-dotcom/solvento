@@ -805,9 +805,9 @@ const [rejectedToday, setRejectedToday] = useState(0);
   // ------------------------------------------------------
   // Meses y paginas. Con mas de cien pendientes la bandeja era un scroll
   // sin fin. Ahora se agrupan por el mes del fichaje (hora de Madrid) y se
-  // ven de 20 en 20.
+  // ven de 10 en 10.
   // ------------------------------------------------------
-  const POR_PAGINA = 20;
+  const POR_PAGINA = 10;
 
   const mesDe = (item: Incident) =>
     claveDiaMadrid(item.check_in_at || item.created_at).slice(0, 7);
