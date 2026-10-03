@@ -209,6 +209,8 @@ export function AdminLayout() {
         .cerbAdmNavBtn {
           width: 100%;
           height: 56px;
+          gap: 10px;
+          padding: 0 12px;
           border: 1px solid ${adminTheme.colors.border};
           border-radius: 14px;
           background: ${adminTheme.colors.panelBg};
@@ -219,6 +221,16 @@ export function AdminLayout() {
           cursor: pointer;
           flex: 0 0 auto;
           transition: background .18s ease, border-color .18s ease, color .18s ease, transform .18s ease;
+        }
+
+        /* Antes el menu era solo de iconos y no se encontraban las
+           secciones (por ejemplo, Empleados, donde se dan las altas). */
+        .cerbAdmNavLabel {
+          font-size: 14px;
+          font-weight: 800;
+          flex: 1 1 auto;
+          text-align: left;
+          white-space: nowrap;
         }
 
         .cerbAdmNavBtn:hover {
@@ -363,6 +375,10 @@ export function AdminLayout() {
             min-width: 56px;
           }
 
+          .cerbAdmNavLabel {
+            display: none;
+          }
+
           .cerbAdmSidebarBrand {
             display: none;
           }
@@ -377,6 +393,7 @@ export function AdminLayout() {
             onClick={() => navigate("/admin")}
           >
             <HomeIcon />
+            <span className="cerbAdmNavLabel">Inicio</span>
           </button>
 
           <button
@@ -385,6 +402,7 @@ export function AdminLayout() {
             onClick={() => navigate("/admin/incidents")}
           >
             <IncidentsIcon />
+            <span className="cerbAdmNavLabel">Incidencias</span>
           </button>
 
           <button
@@ -393,6 +411,7 @@ export function AdminLayout() {
             onClick={() => navigate("/admin/employees")}
           >
             <EmployeesIcon />
+            <span className="cerbAdmNavLabel">Empleados</span>
           </button>
 
           <button
@@ -401,6 +420,7 @@ export function AdminLayout() {
             onClick={() => navigate("/admin/exports")}
           >
             <ExportsIcon />
+            <span className="cerbAdmNavLabel">Exportar</span>
           </button>
 
           <button
@@ -409,6 +429,7 @@ export function AdminLayout() {
             onClick={() => navigate("/admin/settings")}
           >
             <SettingsIcon />
+            <span className="cerbAdmNavLabel">Ajustes</span>
           </button>
 
           <div className="cerbAdmSidebarSpacer" />
