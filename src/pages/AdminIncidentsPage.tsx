@@ -903,10 +903,13 @@ const [rejectedToday, setRejectedToday] = useState(0);
     setPagina(1);
   }
 
-  // Solo las automaticas se pueden resolver en bloque (tienen una jornada
-  // concreta con sus horas). Y solo las que se ven ahora: lo que queda
-  // oculto por un filtro nunca se toca.
-  const resolublesEnBloque = incidenciasDelMes.filter((i) => i.source_type === "automatic");
+  // Se pueden resolver en bloque las automaticas (jornadas) y las "faltan
+  // fichajes" (time_request). Las solicitudes manuales del trabajador no:
+  // llevan una hora propuesta que alguien tiene que mirar. Y solo las que
+  // se ven ahora: lo que queda oculto por un filtro nunca se toca.
+  const resolublesEnBloque = incidenciasDelMes.filter(
+    (i) => i.source_type === "automatic" || i.source_type === "time_request",
+  );
   const seleccionadas = resolublesEnBloque.filter((i) => seleccion.has(i.adjustment_id));
 
   function alternarSeleccion(id: string) {
@@ -950,13 +953,20 @@ const [rejectedToday, setRejectedToday] = useState(0);
     // Una a una: cada resolucion es una operacion completa en el servidor
     // y, si una falla (p. ej. jornada aun abierta), las demas siguen.
     for (const item of seleccionadas) {
-      const { error } = await supabase.rpc("resolve_automatic_incident", {
-        p_time_entry_id: item.time_entry_id,
-        p_decision: decision,
-        p_resolution_reason: motivo,
-        p_check_in: null,
-        p_check_out: null,
-      });
+      const { error } =
+        item.source_type === "time_request"
+          ? await supabase.rpc("resolve_time_entry_request", {
+              p_request_id: item.adjustment_id,
+              p_decision: decision,
+              p_resolution_reason: motivo,
+            })
+          : await supabase.rpc("resolve_automatic_incident", {
+              p_time_entry_id: item.time_entry_id,
+              p_decision: decision,
+              p_resolution_reason: motivo,
+              p_check_in: null,
+              p_check_out: null,
+            });
       if (error) {
         fallos.push(
           `${getWorkerLabel(item.user_id)} (${formatDateTime(item.check_in_at)}): ${error.message}`,
@@ -1695,8 +1705,8 @@ const [rejectedToday, setRejectedToday] = useState(0);
                     <input
                       type="checkbox"
                       className="adminIncChk"
-                      aria-label={`Seleccionar las ${resolublesEnBloque.length} incidencias automáticas de esta vista`}
-                      title={`Seleccionar las ${resolublesEnBloque.length} automáticas de esta vista`}
+                      aria-label={`Seleccionar las ${resolublesEnBloque.length} incidencias de esta vista`}
+                      title={`Seleccionar las ${resolublesEnBloque.length} de esta vista (todas las páginas)`}
                       checked={seleccionadas.length === resolublesEnBloque.length}
                       onChange={alternarTodas}
                     />
@@ -1714,7 +1724,7 @@ const [rejectedToday, setRejectedToday] = useState(0);
               {incidenciasPagina.map((item) => (
                 <tr key={item.adjustment_id}>
                   <td>
-                    {item.source_type === "automatic" && (
+                    {(item.source_type === "automatic" || item.source_type === "time_request") && (
                       <input
                         type="checkbox"
                         className="adminIncChk"
