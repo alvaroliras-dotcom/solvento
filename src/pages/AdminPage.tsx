@@ -5,6 +5,11 @@ import { fetchAllRows } from "../lib/fetchAllRows";
 import { formatFechaHoraMadrid, formatFechaMadrid } from "../lib/madrid";
 import { useActiveMembership } from "../app/useActiveMembership";
 import { adminTheme } from "../ui/adminTheme";
+import {
+  CATEGORIAS,
+  categoriaDeIncidencia,
+  type CategoriaClave,
+} from "../lib/incidentCategories";
 
 // ======================================================
 // PARTE 1/6 — TIPOS Y HELPERS
@@ -21,6 +26,7 @@ type PendingAdjustment = {
   reason: string;
   created_at: string;
   source_type: IncidentSourceType;
+  categoria: CategoriaClave;
 };
 
 type OpenEntry = {
@@ -325,6 +331,14 @@ export function AdminPage() {
     });
   }, [employees, employeeQuery]);
 
+  const pendientesPorTipo = useMemo(() => {
+    const cuenta = new Map<CategoriaClave, number>();
+    for (const it of items) cuenta.set(it.categoria, (cuenta.get(it.categoria) ?? 0) + 1);
+    return CATEGORIAS.map((c) => ({ ...c, total: cuenta.get(c.clave) ?? 0 })).filter(
+      (c) => c.total > 0,
+    );
+  }, [items]);
+
   const groupedPending = useMemo(() => {
     const map = new Map<string, { user_id: string; count: number; latest_created_at: string }>();
 
@@ -500,10 +514,11 @@ export function AdminPage() {
 
     const manual: PendingAdjustment[] = ((manualData ?? []) as Omit<
       PendingAdjustment,
-      "source_type"
+      "source_type" | "categoria"
     >[]).map((item) => ({
       ...item,
       source_type: "manual",
+      categoria: "trabajador",
     }));
 
     // Se pide por bloques: sin paginar, esta consulta se cortaba a las
@@ -547,6 +562,7 @@ export function AdminPage() {
           "Incidencia automática detectada por el sistema",
         created_at: e.check_in_at,
         source_type: "automatic",
+        categoria: categoriaDeIncidencia(e.flags?.auto_incident_reason, "automatic"),
       })) ?? [];
 
     // La bandeja de incidencias se alimenta de tres sitios y este panel
@@ -583,6 +599,7 @@ export function AdminPage() {
         reason: r.reason ?? "Incidencia pendiente",
         created_at: r.requested_at,
         source_type: "automatic",
+        categoria: categoriaDeIncidencia(r.reason, "time_request"),
       }),
     );
 
@@ -1092,6 +1109,66 @@ export function AdminPage() {
     color: ${adminTheme.colors.text};
   }
 
+  .adminKpiLink {
+    cursor: pointer;
+  }
+
+  .adminKpiLink:hover {
+    border-color: ${adminTheme.colors.primary};
+  }
+
+  .adminTipoLista {
+    margin-top: 12px;
+    display: grid;
+    gap: 6px;
+  }
+
+  .adminTipoFila {
+    display: grid;
+    grid-template-columns: minmax(150px, 220px) 1fr 44px;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid ${adminTheme.colors.border};
+    border-radius: 12px;
+    background: ${adminTheme.colors.panelBg};
+    color: ${adminTheme.colors.text};
+    cursor: pointer;
+    text-align: left;
+    font: inherit;
+  }
+
+  .adminTipoFila:hover {
+    border-color: ${adminTheme.colors.primary};
+    background: ${adminTheme.colors.primarySoft};
+  }
+
+  .adminTipoNombre {
+    font-weight: 700;
+    font-size: 14px;
+  }
+
+  .adminTipoBarra {
+    height: 8px;
+    border-radius: 999px;
+    background: ${adminTheme.colors.panelSoft};
+    overflow: hidden;
+  }
+
+  .adminTipoRelleno {
+    display: block;
+    height: 100%;
+    border-radius: 999px;
+    background: ${adminTheme.colors.primary};
+  }
+
+  .adminTipoNum {
+    text-align: right;
+    font-weight: 800;
+    font-size: 15px;
+  }
+
   .adminCardSub {
     margin: 4px 0 0 0;
     font-size: 13px;
@@ -1245,7 +1322,15 @@ export function AdminPage() {
           <div className="adminKpiValue">{openCount === null ? "…" : openCount}</div>
         </div>
 
-        <div className="adminKpi">
+        <div
+          className="adminKpi adminKpiLink"
+          role="link"
+          tabIndex={0}
+          onClick={openIncidentsPage}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") openIncidentsPage();
+          }}
+        >
           <div className="adminKpiLabel">Incidencias pendientes</div>
           <div className="adminKpiValue">{loading ? "…" : items.length}</div>
         </div>
@@ -1270,6 +1355,34 @@ export function AdminPage() {
 
       <section className="adminGrid">
         <div className="adminCol">
+          {!loading && pendientesPorTipo.length > 0 && (
+            <section className="adminCard">
+              <h2 className="adminCardTitle">Qué hay pendiente</h2>
+              <p className="adminCardSub">
+                Por tipo. Pulsa uno para verlo en la bandeja y resolverlo.
+              </p>
+              <div className="adminTipoLista">
+                {pendientesPorTipo.map((c) => (
+                  <button
+                    key={c.clave}
+                    className="adminTipoFila"
+                    title={c.ayuda}
+                    onClick={() => navigate(`/admin/incidents?tipo=${c.clave}`)}
+                  >
+                    <span className="adminTipoNombre">{c.etiqueta}</span>
+                    <span className="adminTipoBarra">
+                      <span
+                        className="adminTipoRelleno"
+                        style={{ width: `${Math.max(4, (c.total / items.length) * 100)}%` }}
+                      />
+                    </span>
+                    <span className="adminTipoNum">{c.total}</span>
+                  </button>
+                ))}
+              </div>
+            </section>
+          )}
+
           <section className="adminCard">
             <h2 className="adminCardTitle">Incidencias pendientes</h2>
             <p className="adminCardSub">Agrupadas por trabajador</p>

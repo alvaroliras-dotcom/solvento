@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { supabase } from "../lib/supabaseClient";
 import { fetchAllRows } from "../lib/fetchAllRows";
 import {
@@ -10,6 +10,11 @@ import {
 } from "../lib/madrid";
 import { useActiveMembership } from "../app/useActiveMembership";
 import { adminTheme } from "../ui/adminTheme";
+import {
+  CATEGORIAS,
+  categoriaDeIncidencia,
+  type CategoriaClave,
+} from "../lib/incidentCategories";
 
 // ======================================================
 // PARTE 1/6 — TIPOS Y HELPERS
@@ -327,6 +332,19 @@ export function AdminIncidentsPage() {
   const [search, setSearch] = useState("");
   const [mesElegido, setMesElegido] = useState<string>("todas");
   const [pagina, setPagina] = useState(1);
+
+  // El tipo viaja en la direccion (?tipo=ubicacion) para que la portada
+  // pueda abrir la bandeja ya filtrada.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tipoParam = searchParams.get("tipo");
+  const tipoActivo: CategoriaClave | "todas" = CATEGORIAS.some((c) => c.clave === tipoParam)
+    ? (tipoParam as CategoriaClave)
+    : "todas";
+
+  // Seleccion para resolver varias incidencias automaticas de una vez.
+  const [seleccion, setSeleccion] = useState<Set<string>>(new Set());
+  const [motivoLote, setMotivoLote] = useState("");
+  const [resolviendoLote, setResolviendoLote] = useState(false);
 
   // Si no se ha podido saber la empresa (o no hay), no se queda en
   // "Cargando…" para siempre; y el fallo se muestra como error, no como
@@ -787,11 +805,40 @@ const [rejectedToday, setRejectedToday] = useState(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [membership?.company_id]);
 
+  const incidentsDelTipo = useMemo(
+    () =>
+      tipoActivo === "todas"
+        ? incidents
+        : incidents.filter(
+            (item) => categoriaDeIncidencia(item.reason, item.source_type) === tipoActivo,
+          ),
+    [incidents, tipoActivo],
+  );
+
+  const cuentaPorTipo = useMemo(() => {
+    const cuenta = new Map<string, number>();
+    for (const item of incidents) {
+      const c = categoriaDeIncidencia(item.reason, item.source_type);
+      cuenta.set(c, (cuenta.get(c) ?? 0) + 1);
+    }
+    return cuenta;
+  }, [incidents]);
+
+  function elegirTipo(clave: CategoriaClave | "todas") {
+    const next = new URLSearchParams(searchParams);
+    if (clave === "todas") next.delete("tipo");
+    else next.set("tipo", clave);
+    setSearchParams(next, { replace: true });
+    setPagina(1);
+    setMesElegido("todas");
+    setSeleccion(new Set());
+  }
+
   const filteredIncidents = useMemo(() => {
     const q = search.trim().toLowerCase();
-    if (!q) return incidents;
+    if (!q) return incidentsDelTipo;
 
-    return incidents.filter((item) => {
+    return incidentsDelTipo.filter((item) => {
       const workerLabel = getWorkerLabel(item.user_id).toLowerCase();
 
       return (
@@ -800,7 +847,7 @@ const [rejectedToday, setRejectedToday] = useState(0);
         String(item.reason ?? "").toLowerCase().includes(q)
       );
     });
-  }, [incidents, search, profilesById]);
+  }, [incidentsDelTipo, search, profilesById]);
 
   // ------------------------------------------------------
   // Meses y paginas. Con mas de cien pendientes la bandeja era un scroll
@@ -854,6 +901,81 @@ const [rejectedToday, setRejectedToday] = useState(0);
   function elegirMes(mes: string) {
     setMesElegido(mes);
     setPagina(1);
+  }
+
+  // Solo las automaticas se pueden resolver en bloque (tienen una jornada
+  // concreta con sus horas). Y solo las que se ven ahora: lo que queda
+  // oculto por un filtro nunca se toca.
+  const resolublesEnBloque = incidenciasDelMes.filter((i) => i.source_type === "automatic");
+  const seleccionadas = resolublesEnBloque.filter((i) => seleccion.has(i.adjustment_id));
+
+  function alternarSeleccion(id: string) {
+    setSeleccion((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function alternarTodas() {
+    setSeleccion(
+      seleccionadas.length === resolublesEnBloque.length
+        ? new Set()
+        : new Set(resolublesEnBloque.map((i) => i.adjustment_id)),
+    );
+  }
+
+  async function resolverLote(decision: "validated" | "rejected") {
+    if (resolviendoLote || seleccionadas.length === 0) return;
+
+    const motivo = motivoLote.trim();
+    if (motivo.length < 3) {
+      alert("Escribe el motivo de la resolución (mínimo 3 caracteres).");
+      return;
+    }
+
+    const accion = decision === "validated" ? "VALIDAR tal como están" : "RECHAZAR";
+    if (
+      !window.confirm(
+        `Vas a ${accion} ${seleccionadas.length} incidencias con el motivo:\n\n"${motivo}"\n\nQueda registrado en el historial. ¿Continuar?`,
+      )
+    ) {
+      return;
+    }
+
+    setResolviendoLote(true);
+    const fallos: string[] = [];
+
+    // Una a una: cada resolucion es una operacion completa en el servidor
+    // y, si una falla (p. ej. jornada aun abierta), las demas siguen.
+    for (const item of seleccionadas) {
+      const { error } = await supabase.rpc("resolve_automatic_incident", {
+        p_time_entry_id: item.time_entry_id,
+        p_decision: decision,
+        p_resolution_reason: motivo,
+        p_check_in: null,
+        p_check_out: null,
+      });
+      if (error) {
+        fallos.push(
+          `${getWorkerLabel(item.user_id)} (${formatDateTime(item.check_in_at)}): ${error.message}`,
+        );
+      }
+    }
+
+    setResolviendoLote(false);
+    setSeleccion(new Set());
+    setMotivoLote("");
+    await loadIncidents();
+
+    if (fallos.length > 0) {
+      alert(
+        `${seleccionadas.length - fallos.length} resueltas. ${fallos.length} no se han podido resolver:\n\n` +
+          fallos.slice(0, 8).join("\n") +
+          (fallos.length > 8 ? `\n… y ${fallos.length - 8} más` : ""),
+      );
+    }
   }
 
   const flags = selectedEntryGeo?.flags ?? null;
@@ -961,6 +1083,41 @@ const [rejectedToday, setRejectedToday] = useState(0);
 
         .adminIncMes.isActive .adminIncMesNum {
           background: rgba(255, 255, 255, .25);
+        }
+
+        .adminIncLote {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+          align-items: center;
+          margin-top: 12px;
+          padding: 12px;
+          border: 1px solid ${adminTheme.colors.primary};
+          border-radius: 14px;
+          background: ${adminTheme.colors.primarySoft};
+        }
+
+        .adminIncLote strong {
+          font-weight: 800;
+        }
+
+        .adminIncLote .adminIncInput {
+          flex: 1;
+          min-width: 220px;
+        }
+
+        .adminIncChk {
+          width: 18px;
+          height: 18px;
+          cursor: pointer;
+          accent-color: ${adminTheme.colors.primary};
+        }
+
+        .adminIncTipoAyuda {
+          margin: 8px 0 0;
+          font-size: 13px;
+          font-weight: 600;
+          color: ${adminTheme.colors.textSoft};
         }
 
         .adminIncPaginacion {
@@ -1443,6 +1600,34 @@ const [rejectedToday, setRejectedToday] = useState(0);
         <h2 className="adminIncCardTitle">Incidencias</h2>
         <p className="adminIncCardSub">Bandeja de incidencias pendientes, por mes del fichaje</p>
 
+        <div className="adminIncMeses" role="tablist" aria-label="Tipo de incidencia">
+          <button
+            role="tab"
+            aria-selected={tipoActivo === "todas"}
+            className={`adminIncMes ${tipoActivo === "todas" ? "isActive" : ""}`}
+            onClick={() => elegirTipo("todas")}
+          >
+            Todos los tipos <span className="adminIncMesNum">{incidents.length}</span>
+          </button>
+          {CATEGORIAS.filter((c) => (cuentaPorTipo.get(c.clave) ?? 0) > 0).map((c) => (
+            <button
+              key={c.clave}
+              role="tab"
+              aria-selected={tipoActivo === c.clave}
+              className={`adminIncMes ${tipoActivo === c.clave ? "isActive" : ""}`}
+              onClick={() => elegirTipo(c.clave)}
+            >
+              {c.etiqueta} <span className="adminIncMesNum">{cuentaPorTipo.get(c.clave)}</span>
+            </button>
+          ))}
+        </div>
+
+        {tipoActivo !== "todas" && (
+          <p className="adminIncTipoAyuda">
+            {CATEGORIAS.find((c) => c.clave === tipoActivo)?.ayuda}
+          </p>
+        )}
+
         {meses.length > 0 && (
           <div className="adminIncMeses" role="tablist" aria-label="Mes">
             <button
@@ -1467,10 +1652,56 @@ const [rejectedToday, setRejectedToday] = useState(0);
           </div>
         )}
 
+        {seleccionadas.length > 0 && (
+          <div className="adminIncLote">
+            <strong>{seleccionadas.length} seleccionadas</strong>
+            <input
+              className="adminIncInput"
+              placeholder="Motivo (obligatorio, queda en el historial)"
+              value={motivoLote}
+              onChange={(e) => setMotivoLote(e.target.value)}
+              disabled={resolviendoLote}
+            />
+            <button
+              className="adminIncBtn primary"
+              disabled={resolviendoLote}
+              onClick={() => resolverLote("validated")}
+            >
+              {resolviendoLote ? "Resolviendo…" : "Validar como están"}
+            </button>
+            <button
+              className="adminIncBtn danger"
+              disabled={resolviendoLote}
+              onClick={() => resolverLote("rejected")}
+            >
+              Rechazar
+            </button>
+            <button
+              className="adminIncBtn"
+              disabled={resolviendoLote}
+              onClick={() => setSeleccion(new Set())}
+            >
+              Quitar selección
+            </button>
+          </div>
+        )}
+
         <div className="adminIncTableWrap">
           <table className="adminIncTable">
             <thead>
               <tr>
+                <th style={{ width: 36 }}>
+                  {resolublesEnBloque.length > 0 && (
+                    <input
+                      type="checkbox"
+                      className="adminIncChk"
+                      aria-label={`Seleccionar las ${resolublesEnBloque.length} incidencias automáticas de esta vista`}
+                      title={`Seleccionar las ${resolublesEnBloque.length} automáticas de esta vista`}
+                      checked={seleccionadas.length === resolublesEnBloque.length}
+                      onChange={alternarTodas}
+                    />
+                  )}
+                </th>
                 <th>Tipo</th>
                 <th>Trabajador</th>
                 <th>Entrada</th>
@@ -1482,6 +1713,17 @@ const [rejectedToday, setRejectedToday] = useState(0);
             <tbody>
               {incidenciasPagina.map((item) => (
                 <tr key={item.adjustment_id}>
+                  <td>
+                    {item.source_type === "automatic" && (
+                      <input
+                        type="checkbox"
+                        className="adminIncChk"
+                        aria-label="Seleccionar incidencia"
+                        checked={seleccion.has(item.adjustment_id)}
+                        onChange={() => alternarSeleccion(item.adjustment_id)}
+                      />
+                    )}
+                  </td>
                   <td>{getIncidentTypeLabel(item.source_type)}</td>
                   <td>{getWorkerLabel(item.user_id)}</td>
                   <td>{formatDateTime(item.check_in_at)}</td>
@@ -1502,7 +1744,7 @@ const [rejectedToday, setRejectedToday] = useState(0);
               {!tableLoading && tableError && (
                 <tr>
                   <td
-                    colSpan={6}
+                    colSpan={7}
                     className="adminIncEmpty"
                     style={{
                       color: adminTheme.colors.danger,
@@ -1523,7 +1765,7 @@ const [rejectedToday, setRejectedToday] = useState(0);
 
               {!tableLoading && !tableError && filteredIncidents.length === 0 && (
                 <tr>
-                  <td colSpan={6} className="adminIncEmpty">
+                  <td colSpan={7} className="adminIncEmpty">
                     No hay incidencias pendientes.
                   </td>
                 </tr>
@@ -1531,7 +1773,7 @@ const [rejectedToday, setRejectedToday] = useState(0);
 
               {tableLoading && (
                 <tr>
-                  <td colSpan={6} className="adminIncEmpty">
+                  <td colSpan={7} className="adminIncEmpty">
                     Cargando…
                   </td>
                 </tr>
